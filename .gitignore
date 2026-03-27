@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+*.tfstate
+*.tfstate.backup
+.terraform/
+terraform.tfvars
+*.pem
+.env
+files.zip

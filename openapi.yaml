@@ -1,0 +1,564 @@
+openapi: 3.1.0
+info:
+  title: William Tells QR Killer
+  description: |
+    QR code decoder using Apple's Vision framework. Decodes QR codes exactly the way an iPhone does,
+    including obfuscated codes that open-source decoders miss. Applies image mutations (brightness,
+    contrast, scale, blur, rotation, sharpen) to detect hard-to-read codes.
+
+    All scan endpoints are async — they return a job ID immediately (HTTP 202) and you poll for results.
+  version: 1.0.0
+  contact:
+    name: William Tells QR Killer
+
+servers:
+  - url: https://qrscanner.example.com
+    description: Replace with your deployment URL
+
+security:
+  - basicAuth: []
+  - {} # Auth is optional when WTQRK_USER/WTQRK_PASS are not configured
+
+paths:
+  /scan:
+    post:
+      summary: Scan a single image
+      description: |
+        Enqueues a single image for QR scanning using the default mutation config (~60 mutations, early exit on first detection).
+        Returns a job ID to poll for results.
+      operationId: scanImage
+      tags: [Scanning]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScanRequest'
+            example:
+              imageBase64: "iVBORw0KGgoAAAANSUhEUgAA..."
+      responses:
+        '202':
+          description: Job queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+              example:
+                id: "1c28e693-fda6-42f4-8f2a-a5e8cb8a8dcc"
+                status: "queued"
+        '400':
+          description: Invalid request (bad base64, invalid config)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+
+  /scan/heavy:
+    post:
+      summary: Scan with full mutation sweep
+      description: |
+        Enqueues a single image for scanning with the heavy mutation config (~6,000 mutations, no early exit).
+        Use this when `/scan` finds nothing — it tries every combination of brightness, contrast, scale, blur,
+        rotation, and sharpen.
+      operationId: scanImageHeavy
+      tags: [Scanning]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScanRequest'
+      responses:
+        '202':
+          description: Job queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+
+  /scan/batch:
+    post:
+      summary: Scan multiple images
+      description: |
+        Enqueues a batch of up to 20 images for scanning. Each image is scanned with the default config
+        and early exit. Returns a single job ID — poll for results to get all image reports.
+      operationId: scanBatch
+      tags: [Scanning]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchScanRequest'
+            example:
+              images:
+                - id: "img-001"
+                  imageBase64: "iVBORw0KGgoAAAANSUhEUgAA..."
+                - id: "img-002"
+                  imageBase64: "/9j/4AAQSkZJRgABAQ..."
+      responses:
+        '202':
+          description: Job queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          description: Invalid request (bad base64, batch too large, invalid config)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+
+  /upload:
+    post:
+      summary: Upload files for scanning
+      description: |
+        Accepts multipart file uploads (used by the web UI). Supports PNG, JPEG, HEIC, SVG, PDF,
+        WebP, TIFF, GIF, BMP. Returns a job ID to poll for batch results.
+      operationId: uploadFiles
+      tags: [Scanning]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [default, heavy]
+                  default: default
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+              required:
+                - files
+      responses:
+        '202':
+          description: Job queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          description: No files uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+
+  /jobs/{jobId}:
+    get:
+      summary: Poll job status
+      description: |
+        Returns the current status of a scan job. Poll this endpoint until `status` is `completed` or `failed`.
+
+        For single scans (`/scan`, `/scan/heavy`), the result contains `scanReport`.
+        For batch scans (`/scan/batch`, `/upload`), the result contains `batchResponse`.
+      operationId: getJobStatus
+      tags: [Jobs]
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "1c28e693-fda6-42f4-8f2a-a5e8cb8a8dcc"
+      responses:
+        '200':
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobStatusResponse'
+              examples:
+                queued:
+                  summary: Job queued
+                  value:
+                    id: "1c28e693-fda6-42f4-8f2a-a5e8cb8a8dcc"
+                    status: "queued"
+                    createdAt: "2026-03-26T12:00:00Z"
+                    startedAt: null
+                    completedAt: null
+                    result: null
+                    error: null
+                completed_single:
+                  summary: Single scan completed
+                  value:
+                    id: "1c28e693-fda6-42f4-8f2a-a5e8cb8a8dcc"
+                    status: "completed"
+                    createdAt: "2026-03-26T12:00:00Z"
+                    startedAt: "2026-03-26T12:00:00Z"
+                    completedAt: "2026-03-26T12:00:01Z"
+                    result:
+                      scanReport:
+                        imageDimensions:
+                          width: 800
+                          height: 823
+                        mutationsTried: 0
+                        detections:
+                          - payload: "https://example.com"
+                            symbology: "VNBarcodeSymbologyQR"
+                            confidence: 1.0
+                            boundingBox:
+                              x: 0.35
+                              y: 0.35
+                              width: 0.34
+                              height: 0.22
+                      batchResponse: null
+                    error: null
+                completed_batch:
+                  summary: Batch scan completed
+                  value:
+                    id: "2a39b7e1-abc1-4def-9012-345678abcdef"
+                    status: "completed"
+                    createdAt: "2026-03-26T12:00:00Z"
+                    startedAt: "2026-03-26T12:00:00Z"
+                    completedAt: "2026-03-26T12:00:02Z"
+                    result:
+                      scanReport: null
+                      batchResponse:
+                        totalProcessed: 2
+                        totalWithDetections: 2
+                        results:
+                          - id: "img-001"
+                            durationMs: 39
+                            report:
+                              imageDimensions:
+                                width: 1008
+                                height: 756
+                              mutationsTried: 0
+                              detections:
+                                - payload: "https://example.com/page1"
+                                  symbology: "VNBarcodeSymbologyQR"
+                                  confidence: 1.0
+                                  boundingBox:
+                                    x: 0.18
+                                    y: 0.07
+                                    width: 0.64
+                                    height: 0.84
+                          - id: "img-002"
+                            durationMs: 523
+                            report:
+                              imageDimensions:
+                                width: 600
+                                height: 861
+                              mutationsTried: 1
+                              detections:
+                                - payload: "https://example.com/page2"
+                                  symbology: "VNBarcodeSymbologyQR"
+                                  confidence: 1.0
+                                  boundingBox:
+                                    x: 0.10
+                                    y: 0.35
+                                    width: 0.25
+                                    height: 0.17
+                    error: null
+                failed:
+                  summary: Job failed
+                  value:
+                    id: "1c28e693-fda6-42f4-8f2a-a5e8cb8a8dcc"
+                    status: "failed"
+                    createdAt: "2026-03-26T12:00:00Z"
+                    startedAt: "2026-03-26T12:00:00Z"
+                    completedAt: "2026-03-26T12:00:01Z"
+                    result: null
+                    error: "Could not decode image data. Supported formats: PNG, JPEG, HEIC, SVG, PDF, WebP, TIFF, GIF, BMP."
+        '404':
+          description: Job not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+
+  /health:
+    get:
+      summary: Health check
+      description: Returns `ok` if the service is running. No authentication required.
+      operationId: healthCheck
+      tags: [Utility]
+      security: []
+      responses:
+        '200':
+          description: Healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "ok"
+
+  /config:
+    get:
+      summary: Get mutation configs
+      description: Returns the default and heavy mutation configurations with total mutation counts.
+      operationId: getConfig
+      tags: [Utility]
+      responses:
+        '200':
+          description: Mutation configs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  default:
+                    $ref: '#/components/schemas/MutationConfigInfo'
+                  heavy:
+                    $ref: '#/components/schemas/MutationConfigInfo'
+        '401':
+          description: Unauthorized
+
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: Set via WTQRK_USER and WTQRK_PASS environment variables on the server.
+
+  schemas:
+    ScanRequest:
+      type: object
+      required: [imageBase64]
+      properties:
+        imageBase64:
+          type: string
+          format: byte
+          description: Base64-encoded image (PNG, JPEG, HEIC, SVG, PDF, WebP, TIFF, GIF, BMP)
+        config:
+          $ref: '#/components/schemas/MutationConfig'
+
+    BatchScanRequest:
+      type: object
+      required: [images]
+      properties:
+        images:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/BatchImage'
+        config:
+          $ref: '#/components/schemas/MutationConfig'
+
+    BatchImage:
+      type: object
+      required: [id, imageBase64]
+      properties:
+        id:
+          type: string
+          description: Caller-assigned identifier for this image
+        imageBase64:
+          type: string
+          format: byte
+
+    MutationConfig:
+      type: object
+      description: |
+        Override the default mutation parameters. All fields are optional — omitted fields use defaults.
+        Limits: max 10 values per dimension, max 10,000 total mutations.
+      properties:
+        scales:
+          type: array
+          items:
+            type: number
+          description: "Scale factors (0, 5.0]. Default: [0.75, 1.0, 1.5]"
+        brightnessDeltas:
+          type: array
+          items:
+            type: number
+          description: "Brightness adjustments. Default: [-0.3, -0.15, 0.0, 0.15, 0.3]"
+        contrastDeltas:
+          type: array
+          items:
+            type: number
+          description: "Contrast adjustments. Default: [-0.1, 0.0]"
+        blurRadii:
+          type: array
+          items:
+            type: number
+          description: "Gaussian blur radii [0, 10.0]. Default: [0.0, 1.0]"
+        rotationDegrees:
+          type: array
+          items:
+            type: number
+          description: "Rotation in degrees. Default: [0.0]"
+        sharpenIntensities:
+          type: array
+          items:
+            type: number
+          description: "Sharpen intensity. Default: [0.0]"
+
+    MutationConfigInfo:
+      type: object
+      properties:
+        scales:
+          type: array
+          items:
+            type: number
+        brightnessDeltas:
+          type: array
+          items:
+            type: number
+        contrastDeltas:
+          type: array
+          items:
+            type: number
+        blurRadii:
+          type: array
+          items:
+            type: number
+        rotationDegrees:
+          type: array
+          items:
+            type: number
+        sharpenIntensities:
+          type: array
+          items:
+            type: number
+        totalMutations:
+          type: integer
+
+    JobResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued]
+
+    JobStatusResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued, processing, completed, failed]
+        createdAt:
+          type: string
+          format: date-time
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+        result:
+          $ref: '#/components/schemas/JobResult'
+        error:
+          type: string
+          nullable: true
+
+    JobResult:
+      type: object
+      description: Exactly one of scanReport or batchResponse will be non-null.
+      properties:
+        scanReport:
+          $ref: '#/components/schemas/ScanReport'
+        batchResponse:
+          $ref: '#/components/schemas/BatchScanResponse'
+
+    ScanReport:
+      type: object
+      properties:
+        imageDimensions:
+          $ref: '#/components/schemas/ImageDimensions'
+        mutationsTried:
+          type: integer
+          description: "Number of mutations tried. 0 means decoded on raw image."
+        detections:
+          type: array
+          items:
+            $ref: '#/components/schemas/QRDetection'
+
+    BatchScanResponse:
+      type: object
+      properties:
+        totalProcessed:
+          type: integer
+        totalWithDetections:
+          type: integer
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/BatchImageReport'
+
+    BatchImageReport:
+      type: object
+      properties:
+        id:
+          type: string
+        durationMs:
+          type: integer
+          description: Processing time in milliseconds
+        report:
+          $ref: '#/components/schemas/ScanReport'
+
+    QRDetection:
+      type: object
+      properties:
+        payload:
+          type: string
+          description: Decoded content of the barcode
+        symbology:
+          type: string
+          description: "Barcode type (e.g. VNBarcodeSymbologyQR, VNBarcodeSymbologyAztec)"
+        confidence:
+          type: number
+          format: float
+          description: Detection confidence (0.0 - 1.0)
+        boundingBox:
+          $ref: '#/components/schemas/BoundingBox'
+
+    BoundingBox:
+      type: object
+      description: Normalized bounding box in Vision coordinates (origin bottom-left, values 0.0-1.0)
+      properties:
+        x:
+          type: number
+        y:
+          type: number
+        width:
+          type: number
+        height:
+          type: number
+
+    ImageDimensions:
+      type: object
+      properties:
+        width:
+          type: integer
+        height:
+          type: integer
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: boolean
+        reason:
+          type: string

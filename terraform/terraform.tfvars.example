@@ -1,0 +1,20 @@
+# Required
+hostname         = "qrscanner.example.com"
+hosted_zone_id   = "Z0123456789ABCDEFGHIJ"
+key_name         = "my-ec2-keypair"
+private_key_path = "~/.ssh/my-key.pem"
+
+# Optional — basic auth (both must be set to enable)
+# wtqrk_user = ""
+# wtqrk_pass = ""
+
+# Required — restrict SSH access to your IP
+ssh_allowed_cidrs = ["1.2.3.4/32"]
+
+# Optional — defaults shown
+# region             = "us-east-1"
+# availability_zone  = "us-east-1a"
+# secondary_az       = "us-east-1b"
+# instance_type      = "mac2.metal"
+# app_port           = 8080
+# root_volume_size   = 100
