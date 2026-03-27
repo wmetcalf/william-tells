@@ -239,3 +239,9 @@ Terraform handles the build, launchd service install, and health check automatic
 | `WTQRK_USER` | _(none)_ | Basic auth username (both must be set to enable) |
 | `WTQRK_PASS` | _(none)_ | Basic auth password |
 | `WTQRK_MAX_QUEUE` | `100` | Max pending jobs before 429 rejection |
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+This software uses Apple's Vision framework and CoreImage, which are proprietary frameworks included with macOS. Running this software requires macOS and is subject to the [Apple macOS Software License Agreement](https://www.apple.com/legal/sla/).
