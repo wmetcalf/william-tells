@@ -16,6 +16,9 @@ dev = ["pytest>=8", "ruff>=0.5"]
 [tool.setuptools.packages.find]
 include = ["william_tells*"]
 
+[tool.setuptools.package-data]
+william_tells = ["static/*.html", "static/assets/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"

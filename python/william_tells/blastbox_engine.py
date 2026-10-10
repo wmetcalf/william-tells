@@ -26,7 +26,7 @@ Operator configuration (worker env, never job params):
                         the warm plan cache, which is built by the self-test)
 
 Per-job params (forwarded by the dispatcher; allowlist them with
-``BLASTBOX_ENGINE_WILLIAM_TELLS_PARAM_KEYS=WTQRK_MODE,WTQRK_CONFIG``):
+``BLASTBOX_ENGINE_WILLIAMTELLS_PARAM_KEYS=WTQRK_MODE,WTQRK_CONFIG``):
   WTQRK_MODE            ``default`` (~60 mutations, stop at first hit) or ``heavy`` (full sweep)
   WTQRK_CONFIG          JSON mutation config, same shape and limits as the web API's ``config``
 """
@@ -50,7 +50,7 @@ from blastbox.worker.sandbox import Mount, Sandbox, SandboxRequest, select_sandb
 _log = logging.getLogger("william_tells.blastbox_engine")
 
 SCHEMA = "wtqrk.scan/1"
-ENGINE_NAME = "william-tells"
+ENGINE_NAME = "williamtells"
 ACCELERATORS = frozenset({"gpu", "ane"})
 
 MAX_STDOUT_BYTES = 4 * 1024 * 1024

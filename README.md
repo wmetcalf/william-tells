@@ -25,6 +25,10 @@ For hard-to-read QR codes (low contrast, darkened, blurred), the service applies
 
 ## Quick Start
 
+> The Vapor server below decodes uploads **in-process and unsandboxed**. That's fine on your own
+> machine with your own images. For untrusted input, or to plug into Loadout, deploy the
+> [sandboxed blastbox engine](#sandboxed-scanning-with-blastbox) instead.
+
 ```bash
 # Build
 swift build -c release
@@ -243,32 +247,62 @@ Terraform handles the build, launchd service install, and health check automatic
 ## Sandboxed scanning with blastbox
 
 Vision, ImageIO and CoreGraphics are high-value exploit targets (FORCEDENTRY went through
-CoreGraphics, BLASTPASS through ImageIO's WebP decoder), and this service feeds them untrusted
-images. The web service above decodes in a long-lived process. For hostile input, run William
-Tells as a [blastbox](https://github.com/wmetcalf/blastbox) engine instead: **one image per
-process, each in a fresh macOS sandbox** with the GPU and Neural Engine granted, and no network,
-no home directory, and no state carried between images.
+CoreGraphics, BLASTPASS through ImageIO's WebP decoder), and the Vapor service above feeds them
+untrusted images **in one long-lived, unsandboxed process**. Keep it for local use. For hostile
+input, run William Tells as the [blastbox](https://github.com/wmetcalf/blastbox) engine
+`williamtells`: **one image per process, each in a fresh macOS sandbox** with the GPU and Neural
+Engine granted, and no network, no home directory, and no state carried between images. It is
+deployed like ClippyShot, RedTusk and titanarum, so [Loadout](https://github.com/wmetcalf/loadout)
+drives it the same way.
 
 ```
-dispatcher ──▶ Mac: blastbox http_agent ──▶ WilliamTellsEngine ──▶ seatbelt/appsandbox ──▶ wtqrk-scan
+client / Loadout ──▶ blastbox serve ──▶ queue ──▶ blastbox dispatch ──▶ Mac: http_agent ──▶ seatbelt ──▶ wtqrk-scan
+                     (+ this UI)                  (static pool)         WilliamTellsEngine    (per image)
 ```
 
-Pieces in this repo:
+The ingress and dispatcher never decode an image; only the sandboxed `wtqrk-scan` does. They
+can run on the Mac (Mac-only) or on Linux next to the other engines, with Macs as the pool.
 
 | Path | What |
 |---|---|
 | `Sources/wtqrk-scan/` | One-shot CLI: `scan <image>` → one JSON document on stdout; `self-test`; `render-qr`; `devices`. No Vapor. |
-| `Sources/QRScanCore/` | The scanner and models, shared by the web service and the CLI. Raster input goes through an ImageIO type allowlist and a 100 M-pixel cap checked before decode. |
-| `python/william_tells/blastbox_engine.py` | The blastbox engine. Validates the CLI's (untrusted) output and maps it to a generic `Record`. |
-| `deploy/blastbox/william-tells.env.example` | Worker and dispatcher configuration. |
+| `Sources/QRScanCore/` | The scanner and models, shared by the Vapor service and the CLI. Raster input goes through an ImageIO type allowlist and a 100 M-pixel cap checked before decode. |
+| `python/william_tells/blastbox_engine.py` | The engine. Validates the CLI's (untrusted) output and maps it to a generic `Record` (`wtqrk.scan/1`). |
+| `python/william_tells/blastbox_ingress.py` + `static/` | Ingress extension: this web UI at `/` and `/jobs/<id>`, on top of the core `/v1/jobs` API. |
+| `deploy/blastbox/williamtells-host.env.example` | Ingress + dispatcher config (one file both source). |
+| `deploy/blastbox/williamtells-worker.env.example` | Mac worker-agent config. |
+
+### Install a Mac worker
 
 ```bash
 swift build -c release                              # builds App and wtqrk-scan
 .build/release/wtqrk-scan self-test                 # decodes a generated QR (on the ANE when present)
 
-pip install -e python/                              # pulls in blastbox
-blastbox macos doctor --accelerator gpu --accelerator ane -- "$PWD/.build/release/wtqrk-scan" self-test
+pip install -e python/                              # pulls in blastbox[host]
+blastbox macos doctor --backend seatbelt --accelerator gpu --accelerator ane \
+    -- "$PWD/.build/release/wtqrk-scan" self-test   # sandbox confines AND the scanner works in it
 ```
+
+Then run the agent with `williamtells-worker.env.example` in blastbox's
+`deploy/macos/io.blastbox.worker-agent.plist`. For a Mac-only deployment, also load
+`io.blastbox.ingress.plist` and `io.blastbox.dispatcher.plist` from the same directory, both
+pointed at your copy of `williamtells-host.env.example`.
+
+### Use it
+
+```bash
+curl -F file=@qr.png -F engine=williamtells -F params=WTQRK_MODE=heavy http://HOST:8005/v1/jobs
+curl http://HOST:8005/v1/jobs/<job_id>              # status; result_summary.meta.detection_count
+curl http://HOST:8005/v1/jobs/<job_id>/metadata     # the decoded payloads (payload.fields.payloads)
+curl http://HOST:8005/v1/jobs/<job_id>/attestation  # signed receipt (with BLASTBOX_ATTEST_KEY)
+```
+
+Job params (allowlisted on the dispatcher), each sent as its own `params=KEY=VALUE` field:
+`WTQRK_MODE=default|heavy` (same as `/scan` and `/scan/heavy`) and
+`WTQRK_CONFIG=<mutation config JSON>` (same shape and limits as the API's `config`).
+
+**Loadout.** Loadout talks to the ingress (`LOADOUT_WILLIAMTELLS_URL=http://HOST:8005`), maps its
+`mode` setting to `WTQRK_MODE`, and turns each decoded payload into a `url` or `qr_code` artifact.
 
 **Self-test gate.** If a sandbox grant goes missing, Vision usually doesn't fail; it returns *no
 detections*. The engine runs `wtqrk-scan self-test` in the same sandbox before trusting any
@@ -276,12 +310,9 @@ result, and returns `engine_error` (never "no QR found") for every job while it 
 `blastbox macos doctor` after every macOS update.
 
 **Latency** (M4 Pro, macOS 26.6, one QR PNG): 87 ms unsandboxed; 153 ms under `seatbelt`; 95 ms
-under `appsandbox`. The self-test builds a Neural Engine plan cache once; each job gets a
-copy-on-write clone of it, and nothing flows back.
-
-Job params (allowlist them on the dispatcher): `WTQRK_MODE=default|heavy` (same as `/scan` and
-`/scan/heavy`) and `WTQRK_CONFIG=<mutation config JSON>` (same shape and limits as the API's
-`config`).
+under `appsandbox`; about 270 ms end to end through ingress, dispatcher and agent. The self-test
+builds a Neural Engine plan cache once; each job gets a copy-on-write clone of it, and nothing
+flows back.
 
 ## License
 
