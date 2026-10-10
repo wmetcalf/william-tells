@@ -240,6 +240,49 @@ Terraform handles the build, launchd service install, and health check automatic
 | `WTQRK_PASS` | _(none)_ | Basic auth password |
 | `WTQRK_MAX_QUEUE` | `100` | Max pending jobs before 429 rejection |
 
+## Sandboxed scanning with blastbox
+
+Vision, ImageIO and CoreGraphics are high-value exploit targets (FORCEDENTRY went through
+CoreGraphics, BLASTPASS through ImageIO's WebP decoder), and this service feeds them untrusted
+images. The web service above decodes in a long-lived process. For hostile input, run William
+Tells as a [blastbox](https://github.com/wmetcalf/blastbox) engine instead: **one image per
+process, each in a fresh macOS sandbox** with the GPU and Neural Engine granted, and no network,
+no home directory, and no state carried between images.
+
+```
+dispatcher ──▶ Mac: blastbox http_agent ──▶ WilliamTellsEngine ──▶ seatbelt/appsandbox ──▶ wtqrk-scan
+```
+
+Pieces in this repo:
+
+| Path | What |
+|---|---|
+| `Sources/wtqrk-scan/` | One-shot CLI: `scan <image>` → one JSON document on stdout; `self-test`; `render-qr`; `devices`. No Vapor. |
+| `Sources/QRScanCore/` | The scanner and models, shared by the web service and the CLI. Raster input goes through an ImageIO type allowlist and a 100 M-pixel cap checked before decode. |
+| `python/william_tells/blastbox_engine.py` | The blastbox engine. Validates the CLI's (untrusted) output and maps it to a generic `Record`. |
+| `deploy/blastbox/william-tells.env.example` | Worker and dispatcher configuration. |
+
+```bash
+swift build -c release                              # builds App and wtqrk-scan
+.build/release/wtqrk-scan self-test                 # decodes a generated QR (on the ANE when present)
+
+pip install -e python/                              # pulls in blastbox
+blastbox macos doctor --accelerator gpu --accelerator ane -- "$PWD/.build/release/wtqrk-scan" self-test
+```
+
+**Self-test gate.** If a sandbox grant goes missing, Vision usually doesn't fail; it returns *no
+detections*. The engine runs `wtqrk-scan self-test` in the same sandbox before trusting any
+result, and returns `engine_error` (never "no QR found") for every job while it fails. Run
+`blastbox macos doctor` after every macOS update.
+
+**Latency** (M4 Pro, macOS 26.6, one QR PNG): 87 ms unsandboxed; 153 ms under `seatbelt`; 95 ms
+under `appsandbox`. The self-test builds a Neural Engine plan cache once; each job gets a
+copy-on-write clone of it, and nothing flows back.
+
+Job params (allowlist them on the dispatcher): `WTQRK_MODE=default|heavy` (same as `/scan` and
+`/scan/heavy`) and `WTQRK_CONFIG=<mutation config JSON>` (same shape and limits as the API's
+`config`).
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

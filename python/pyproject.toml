@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "william-tells-blastbox"
+version = "0.1.0"
+description = "blastbox engine for William Tells QR Killer: Apple Vision barcode decoding, one sandboxed process per image"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = ["blastbox>=0.1.45"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[tool.setuptools.packages.find]
+include = ["william_tells*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["william_tells"]

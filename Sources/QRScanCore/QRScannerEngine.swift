@@ -3,15 +3,40 @@ import Vision
 import AppKit
 import CoreImage
 import Metal
+import ImageIO
+import UniformTypeIdentifiers
+
+// MARK: - Compute preference
+
+/// Where Vision runs barcode detection. `.auto` lets Vision choose, which is what an iPhone does
+/// and what the service has always used. The others exist so a self-test can prove a specific
+/// accelerator is reachable (a sandbox missing a Neural Engine grant otherwise degrades to an
+/// empty result, not an error).
+public enum ComputePreference: String, Sendable, CaseIterable {
+    case auto, ane, gpu, cpu
+}
+
+public enum ComputeError: Error, LocalizedError {
+    case unavailable(ComputePreference)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unavailable(let pref):
+            return "Vision reports no \(pref.rawValue) compute device for barcode detection on this host"
+        }
+    }
+}
 
 // MARK: - QR Scanner Engine
 
-actor QRScannerEngine {
+public actor QRScannerEngine {
 
     private let ciContext: CIContext
     private let metalDevice: MTLDevice?
+    private let compute: ComputePreference
 
-    init() {
+    public init(compute: ComputePreference = .auto) {
+        self.compute = compute
         let device = MTLCreateSystemDefaultDevice()
         self.metalDevice = device
         if let device {
@@ -26,10 +51,8 @@ actor QRScannerEngine {
 
     // MARK: - Public API
 
-    func scan(imageData: Data, config: MutationConfig, earlyExit: Bool = false) async throws -> ScanReport {
-        guard let cgImage = Self.loadImage(from: imageData) else {
-            throw ScanError.invalidImageData
-        }
+    public func scan(imageData: Data, config: MutationConfig, earlyExit: Bool = false) async throws -> ScanReport {
+        let cgImage = try Self.loadImage(from: imageData)
 
         let dimensions = ImageDimensions(
             width: cgImage.width,
@@ -198,6 +221,7 @@ actor QRScannerEngine {
         ]
 
         request.usesCPUOnly = false
+        try applyComputePreference(to: request)
 
         var options: [VNImageOption: Any] = [:]
         if let device = metalDevice {
@@ -211,18 +235,74 @@ actor QRScannerEngine {
         return detections
     }
 
+    private func applyComputePreference(to request: VNDetectBarcodesRequest) throws {
+        guard compute != .auto else { return }
+        guard #available(macOS 14.0, *) else { throw ComputeError.unavailable(compute) }
+        let devices = try request.supportedComputeStageDevices[.main] ?? []
+        let match = devices.first { device in
+            switch (compute, device) {
+            case (.ane, .neuralEngine), (.gpu, .gpu), (.cpu, .cpu): return true
+            default: return false
+            }
+        }
+        guard let match else { throw ComputeError.unavailable(compute) }
+        request.setComputeDevice(match, for: .main)
+    }
+
+    /// The compute devices Vision offers for barcode detection here (for self-tests / doctor).
+    public static func availableComputeDevices() -> [String] {
+        guard #available(macOS 14.0, *) else { return [] }
+        let devices = (try? VNDetectBarcodesRequest().supportedComputeStageDevices[.main]) ?? []
+        return devices.map { device in
+            switch device {
+            case .neuralEngine: return "ane"
+            case .gpu: return "gpu"
+            case .cpu: return "cpu"
+            @unknown default: return "other"
+            }
+        }
+    }
+
     // MARK: - Image Loading (PNG, JPEG, HEIC, HEIF, TIFF, GIF, BMP, WebP, SVG, PDF)
 
     private static let vectorRasterSize: CGFloat = 2048
 
-    private static func loadImage(from data: Data) -> CGImage? {
-        if isSVG(data) { return rasterizeSVG(data) }
-        if isPDF(data) { return rasterizePDF(data) }
+    /// Largest raster accepted, checked from the header BEFORE decoding (decompression bombs).
+    public static let maxPixels = 100_000_000
 
-        guard let nsImage = NSImage(data: data),
-              let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
-        else { return nil }
-        return cgImage
+    /// Raster types handed to ImageIO. Everything else ImageIO could parse (RAW, EXR, ICNS, PSD,
+    /// TGA, …) is refused: each extra decoder is attack surface this service doesn't need.
+    private static let rasterTypes: Set<String> = [
+        UTType.png, .jpeg, .heic, .heif, .webP, .tiff, .gif, .bmp,
+    ].reduce(into: Set<String>()) { $0.insert($1.identifier) }
+
+    static func loadImage(from data: Data) throws -> CGImage {
+        if isSVG(data) {
+            guard let image = rasterizeSVG(data) else { throw ScanError.invalidImageData }
+            return image
+        }
+        if isPDF(data) {
+            guard let image = rasterizePDF(data) else { throw ScanError.invalidImageData }
+            return image
+        }
+
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, options),
+              let type = CGImageSourceGetType(source) as String?
+        else { throw ScanError.invalidImageData }
+        guard rasterTypes.contains(type) else { throw ScanError.unsupportedType(type) }
+        guard let props = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0
+        else { throw ScanError.invalidImageData }
+        guard width.multipliedReportingOverflow(by: height).overflow == false,
+              width * height <= maxPixels
+        else { throw ScanError.imageTooLarge(width: width, height: height) }
+        guard let image = CGImageSourceCreateImageAtIndex(source, 0, options) else {
+            throw ScanError.invalidImageData
+        }
+        return image
     }
 
     private static func isSVG(_ data: Data) -> Bool {
@@ -292,13 +372,19 @@ actor QRScannerEngine {
 
 // MARK: - Errors
 
-enum ScanError: Error, LocalizedError {
+public enum ScanError: Error, LocalizedError {
     case invalidImageData
+    case unsupportedType(String)
+    case imageTooLarge(width: Int, height: Int)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .invalidImageData:
             return "Could not decode image data. Supported formats: PNG, JPEG, HEIC, SVG, PDF, WebP, TIFF, GIF, BMP."
+        case .unsupportedType(let type):
+            return "Unsupported image type \(type). Supported formats: PNG, JPEG, HEIC, SVG, PDF, WebP, TIFF, GIF, BMP."
+        case .imageTooLarge(let width, let height):
+            return "Image is \(width)x\(height) pixels; the limit is \(QRScannerEngine.maxPixels) pixels."
         }
     }
 }

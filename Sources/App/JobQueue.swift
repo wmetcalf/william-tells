@@ -1,5 +1,6 @@
 import Foundation
 import Vapor
+import QRScanCore
 
 // MARK: - Job Types
 

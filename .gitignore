@@ -7,3 +7,6 @@ terraform.tfvars
 *.pem
 .env
 files.zip
+python/.venv/
+__pycache__/
+*.egg-info/
