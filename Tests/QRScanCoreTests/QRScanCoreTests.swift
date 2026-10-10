@@ -31,11 +31,12 @@ import zlib
         }
     }
 
-    /// A PNG whose IHDR claims 20000x20000 must be refused from the header alone --
+    /// A ~60 KB PNG that decodes to 20000x20000 must be refused from the header alone --
     /// before ImageIO is asked to allocate 1.6 GB for it.
-    @Test func decompressionBombRefusedBeforeDecode() {
+    @Test func decompressionBombRefusedBeforeDecode() throws {
+        let bomb = try #require(pngBomb(width: 20000, height: 20000))
         do {
-            _ = try QRScannerEngine.loadImage(from: pngHeader(width: 20000, height: 20000))
+            _ = try QRScannerEngine.loadImage(from: bomb)
             Issue.record("expected imageTooLarge")
         } catch ScanError.imageTooLarge(let w, let h) {
             #expect(w == 20000 && h == 20000)
@@ -93,15 +94,35 @@ private func qrPNG(_ message: String) -> Data? {
     return CIContext().pngRepresentation(of: qr.composited(over: canvas), format: .RGBA8, colorSpace: cs)
 }
 
-/// PNG signature + a valid IHDR chunk (correct CRC) and nothing else.
-private func pngHeader(width: UInt32, height: UInt32) -> Data {
+/// A complete, valid 1-bit grayscale PNG of all-zero pixels. ImageIO refuses a header-only PNG
+/// as invalid data, so the bomb has to be real; the zeros deflate to almost nothing.
+private func pngBomb(width: UInt32, height: UInt32) -> Data? {
+    let rowBytes = 1 + (Int(width) + 7) / 8                     // filter byte + packed pixels
+    let raw = Data(count: rowBytes * Int(height))
+    var destLen = compressBound(uLong(raw.count))
+    var idat = Data(count: Int(destLen))
+    let rc = idat.withUnsafeMutableBytes { dst in
+        raw.withUnsafeBytes { src in
+            compress2(dst.bindMemory(to: Bytef.self).baseAddress, &destLen,
+                      src.bindMemory(to: Bytef.self).baseAddress, uLong(raw.count), 9)
+        }
+    }
+    guard rc == Z_OK else { return nil }
+    idat.count = Int(destLen)
+
+    var ihdr = Data()
+    for v in [width, height] { withUnsafeBytes(of: v.bigEndian) { ihdr.append(contentsOf: $0) } }
+    ihdr.append(contentsOf: [1, 0, 0, 0, 0])   // 1-bit grayscale, deflate, no filter, no interlace
+
     var d = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
-    var body = Data("IHDR".utf8)
-    for v in [width, height] { withUnsafeBytes(of: v.bigEndian) { body.append(contentsOf: $0) } }
-    body.append(contentsOf: [8, 6, 0, 0, 0])   // 8-bit RGBA, deflate, no filter, no interlace
-    withUnsafeBytes(of: UInt32(13).bigEndian) { d.append(contentsOf: $0) }
-    d.append(body)
-    let crc = body.withUnsafeBytes { UInt32(crc32(0, $0.bindMemory(to: UInt8.self).baseAddress, uInt(body.count))) }
-    withUnsafeBytes(of: crc.bigEndian) { d.append(contentsOf: $0) }
+    for (type, body) in [("IHDR", ihdr), ("IDAT", idat), ("IEND", Data())] {
+        let chunk = Data(type.utf8) + body
+        withUnsafeBytes(of: UInt32(body.count).bigEndian) { d.append(contentsOf: $0) }
+        d.append(chunk)
+        let crc = chunk.withUnsafeBytes {
+            UInt32(crc32(0, $0.bindMemory(to: Bytef.self).baseAddress, uInt(chunk.count)))
+        }
+        withUnsafeBytes(of: crc.bigEndian) { d.append(contentsOf: $0) }
+    }
     return d
 }
