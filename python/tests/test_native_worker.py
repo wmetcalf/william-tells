@@ -198,3 +198,25 @@ def test_a_retired_slot_makes_the_agent_unhealthy(tmp_path):
             data.unlink()
         if (tmp_path / "real-data").exists():      # moved out, even if the symlink was refused
             os.rename(tmp_path / "real-data", data)
+
+
+def test_rejected_uploads_are_not_buffered(agent):
+    # Auth runs before the body is read (a streamed route): 150 MB -- past the 100 MiB cap --
+    # from a peer with the wrong token is discarded as it arrives, never collected in memory.
+    a, _ = agent
+
+    def rss_kb() -> int:
+        return int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(a.proc.pid)]))
+
+    before, peak, n = rss_kb(), 0, 150
+    chunk = b"\0" * (1 << 20)
+    with socket.create_connection(("127.0.0.1", a.port), timeout=30) as s:
+        s.sendall((f"POST /detonate?name=in.png HTTP/1.1\r\nHost: x\r\nX-aws-proxy-auth: wrong\r\n"
+                   f"Content-Length: {n << 20}\r\n\r\n").encode())
+        for i in range(n):
+            s.sendall(chunk)
+            if i % 25 == 0:
+                peak = max(peak, rss_kb())
+        status = s.recv(4096).split(b"\r\n", 1)[0]
+    assert status.split()[1] == b"401", status
+    assert peak - before < 32 << 10, f"worker grew {peak - before} KB on a rejected upload"

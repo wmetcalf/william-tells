@@ -126,3 +126,23 @@ private func pngBomb(width: UInt32, height: UInt32) -> Data? {
     }
     return d
 }
+
+@Suite struct SVGDetectionTests {
+    @Test func realSVGDocumentsAreSVG() {
+        for doc in ["<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+                    "\u{FEFF}  <?xml version=\"1.0\"?>\n<!-- hi -->\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\">\n<svg width=\"1\">",
+                    "\n\t<svg>"] {
+            #expect(QRScannerEngine.isSVG(Data(doc.utf8)), "\(doc)")
+        }
+    }
+
+    @Test func otherFormatsMentioningSVGAreNot() {
+        // "<svg" inside a PNG text chunk, a PSD resource, or an XML document whose root isn't svg
+        var png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        png.append(Data("\0\0\0\u{10}tEXtComment\0<svg>".utf8))
+        let psd = Data("8BPS\0\u{1}<svg xmlns=\"x\">".utf8)
+        let xml = Data("<?xml version=\"1.0\"?><html><svg/></html>".utf8)
+        let svgish = Data("<svgfoo/>".utf8)
+        for d in [png, psd, xml, svgish] { #expect(!QRScannerEngine.isSVG(d)) }
+    }
+}

@@ -97,7 +97,9 @@ enum WTQRKWorker {
                                "self_test": gate.ok ? "passed" : "failed",
                                "slot": slotOK ? "ok" : "retired"])
         }
-        app.on(.POST, "detonate", body: .collect(maxSize: ByteCount(value: maxBytes))) { req async -> Response in
+        // .stream: nothing is read until detonate() has checked the peer, the token and the busy
+        // flag, so an unauthenticated or concurrent upload can't make the worker buffer it.
+        app.on(.POST, "detonate", body: .stream) { req async -> Response in
             await agent.detonate(req)
         }
         app.logger.info("""
@@ -156,8 +158,15 @@ final class Agent: Sendable {
         guard busy.tryAcquire() else { return Agent.json(.conflict, ["error": "busy"]) }
         defer { busy.release() }
 
-        let body = req.body.data.map { Data(buffer: $0) } ?? Data()
-        guard body.count <= maxBytes else { return Agent.json(.payloadTooLarge, ["error": "too_large"]) }
+        if let declared = req.headers.first(name: .contentLength).flatMap(Int.init), declared > maxBytes {
+            return Agent.json(.payloadTooLarge, ["error": "too_large"])
+        }
+        let body: Data
+        do {
+            body = try await req.body.collect(max: maxBytes).get().map { Data(buffer: $0) } ?? Data()
+        } catch {
+            return Agent.json(.payloadTooLarge, ["error": "too_large"])
+        }
         let params = parseParams(req.headers.first(name: "X-Blastbox-Params"))
 
         let dir = FileManager.default.temporaryDirectory

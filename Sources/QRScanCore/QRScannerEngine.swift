@@ -305,10 +305,35 @@ public actor QRScannerEngine {
         return image
     }
 
-    private static func isSVG(_ data: Data) -> Bool {
-        let prefix = data.prefix(1024)
-        guard let str = String(data: prefix, encoding: .utf8)?.lowercased() else { return false }
-        return str.contains("<svg") || (str.contains("<?xml") && str.contains("svg"))
+    /// SVG only if the document's first element is `<svg`: after an optional BOM, whitespace,
+    /// an XML declaration / processing instructions, comments and a DOCTYPE -- nothing else.
+    /// (A substring test would send a PNG or PSD with "<svg" in a text chunk to NSImage, which
+    /// auto-detects the real format and skips the raster allowlist and pixel limit.)
+    static func isSVG(_ data: Data) -> Bool {
+        var bytes = data.prefix(4096)
+        if bytes.starts(with: [0xEF, 0xBB, 0xBF]) { bytes = bytes.dropFirst(3) }
+        guard let text = String(data: Data(bytes), encoding: .utf8)
+                ?? String(data: Data(bytes.prefix(bytes.count - 3)), encoding: .utf8)   // cut mid-char
+        else { return false }
+        var rest = Substring(text)
+        while true {
+            rest = rest.drop(while: { $0.isWhitespace })
+            if rest.hasPrefix("<?") {
+                guard let end = rest.range(of: "?>") else { return false }
+                rest = rest[end.upperBound...]
+            } else if rest.hasPrefix("<!--") {
+                guard let end = rest.range(of: "-->") else { return false }
+                rest = rest[end.upperBound...]
+            } else if rest.prefix(9).lowercased() == "<!doctype" {
+                guard let end = rest.firstIndex(of: ">") else { return false }
+                rest = rest[rest.index(after: end)...]
+            } else {
+                break
+            }
+        }
+        guard rest.hasPrefix("<svg") else { return false }
+        let next = rest.dropFirst(4).first
+        return next == nil || next == ">" || next == "/" || next!.isWhitespace
     }
 
     private static func isPDF(_ data: Data) -> Bool {
