@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- One-shot at boot: load the service into ec2-user's launchd domain (see com.wtqrk.qrscanner). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.wtqrk.qrscanner-bootstrap</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>/bin/launchctl bootstrap "user/$(/usr/bin/id -u ec2-user)" /Users/ec2-user/Library/LaunchAgents/com.wtqrk.qrscanner.plist</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>/var/log/wtqrk/bootstrap.log</string>
+</dict>
+</plist>

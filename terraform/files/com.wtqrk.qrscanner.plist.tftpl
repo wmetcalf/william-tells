@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The service runs as ec2-user in that user's launchd domain (user/<uid>), not as a LaunchDaemon:
+  App Sandbox (the per-image scanner) only initializes in a per-user domain. Under the system
+  domain secinitd refuses to register the scanner and every scan fails the self-test.
+  Background = the user/<uid> domain, which needs no GUI login; com.wtqrk.qrscanner-bootstrap
+  loads it there at boot.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.wtqrk.qrscanner</string>
+  <key>ProgramArguments</key><array><string>/Users/ec2-user/qr-scanner/.build/release/App</string><string>--env</string><string>production</string></array>
+  <key>WorkingDirectory</key><string>/Users/ec2-user/qr-scanner</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>/Users/ec2-user</string>
+    <key>PORT</key><string>${app_port}</string>
+    <key>WTQRK_USER</key><string>${wtqrk_user}</string>
+    <key>WTQRK_PASS</key><string>${wtqrk_pass}</string>
+  </dict>
+  <key>LimitLoadToSessionType</key><string>Background</string>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/var/log/wtqrk/stdout.log</string>
+  <key>StandardErrorPath</key><string>/var/log/wtqrk/stderr.log</string>
+</dict>
+</plist>

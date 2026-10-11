@@ -313,6 +313,11 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.wmetcalf.wtqrk
 grep "self-test passed" /tmp/wtqrk-worker.log       # the gate ran on this Mac
 ```
 
+It must run in a per-user launchd domain: App Sandbox can't start the scanner from a
+LaunchDaemon (the system domain), so the self-test fails there. For a Mac with no GUI login, load
+it into `user/<uid>` with `LimitLoadToSessionType` `Background`; the plist's header has the
+commands, and `terraform/` deploys the web service that way.
+
 The ingress and dispatcher run wherever your other blastbox engines do. For a Mac-only
 deployment, load blastbox's `deploy/macos/io.blastbox.ingress.plist` and
 `io.blastbox.dispatcher.plist` (`pip install -e python/` gives you blastbox), both pointed at your

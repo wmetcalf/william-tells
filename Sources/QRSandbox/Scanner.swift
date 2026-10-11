@@ -84,7 +84,10 @@ public actor SandboxedScanner {
         } catch {
             return (false, "could not start the scanner: \(error)")
         }
-        let detail = String(decoding: r.stdout.suffix(1500), as: UTF8.self)
+        // rc and the kill reason first: a scanner that App Sandbox refused to set up dies before
+        // printing anything (e.g. under a LaunchDaemon, where secinitd won't register it).
+        let detail = "rc=\(r.exitCode)\(r.killed.map { " killed=\($0)" } ?? "") "
+            + String(decoding: r.stdout.suffix(1500), as: UTF8.self)
             + String(decoding: r.stderr.suffix(500), as: UTF8.self)
         guard r.killed == nil, r.exitCode == 0,
               let out = try? JSONDecoder().decode(SelfTestOutput.self, from: r.stdout), out.ok

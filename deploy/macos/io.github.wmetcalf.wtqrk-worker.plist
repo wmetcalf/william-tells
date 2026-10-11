@@ -15,8 +15,17 @@
   load a copy per slot with its own Label, WTQRK_WORKER_SLOT and BLASTBOX_WORKER_AGENT_PORT, and
   list each port.
 
-  A per-user agent, not a LaunchDaemon: the Neural Engine has only been verified from a logged-in
-  user session. Run it as a dedicated user that owns nothing else.
+  A per-user agent, never a LaunchDaemon: App Sandbox only initializes in a per-user launchd
+  domain. Tested: in the system domain (a LaunchDaemon, even with UserName) secinitd refuses to
+  register the scanner and the self-test fails; gui/<uid> and user/<uid> both pass. Run it as a
+  dedicated user that owns nothing else.
+
+  Headless (no GUI login, e.g. EC2): add
+    <key>LimitLoadToSessionType</key><string>Background</string>
+  and load it into the user's background domain instead:
+    sudo launchctl bootstrap user/$(id -u worker) /Users/worker/Library/LaunchAgents/io.github.wmetcalf.wtqrk-worker.plist
+  That domain isn't started at boot; a one-shot LaunchDaemon running the same bootstrap command
+  (RunAtLoad) does it; see terraform/files/com.wtqrk.qrscanner-bootstrap.plist.
 -->
 <plist version="1.0">
 <dict>
