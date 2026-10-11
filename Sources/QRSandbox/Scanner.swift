@@ -155,14 +155,16 @@ public actor SandboxedScanner {
             catch { return .rejected(code: "bad_config", message: "\(error)") }
         }
 
-        guard let slot = await checkout() else {
-            return .engineError(code: "no_clean_slot",
-                                message: "every sandbox slot was retired: \(retired)")
+        // A slot that can't be cleaned is retired; take the next one. Fail only when none is left.
+        var picked: SandboxSlot?
+        while picked == nil {
+            guard let slot = await checkout() else {
+                return .engineError(code: "no_clean_slot",
+                                    message: "every sandbox slot was retired: \(retired)")
+            }
+            if clean(slot) { picked = slot }
         }
-        guard clean(slot) else {
-            return .engineError(code: "slot_unclean",
-                                message: "slot \(slot.identifier) could not be cleaned and was retired")
-        }
+        let slot = picked!
         argv[0] = slot.executable.path
         if planCacheReady { Container.seed(slot.containerData, from: planCache) }
         let r: RunResult

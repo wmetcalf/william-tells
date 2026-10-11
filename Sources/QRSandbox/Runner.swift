@@ -76,7 +76,7 @@ public enum Runner {
         let deadline = t0.addingTimeInterval(limits.timeoutSeconds)
         // Everything in the slot's container counts toward the cap, so a child that left the
         // process group and tree (an intermediate + setsid) is still metered. Rescanned every
-        // ~50 ms (it walks all of our processes); the group and tree every 5 ms.
+        // ~20 ms (it walks every process, ~0.4 ms); the group and tree every 5 ms.
         var inContainer: Set<pid_t> = []
         var tick = 0
         while true {
@@ -92,12 +92,12 @@ public enum Runner {
                     killed = "memory"
                 }
                 if killed != nil {
-                    // Fresh, not the ~50 ms-old snapshot: a pid in it may have been reused.
+                    // Fresh, not the last snapshot: a pid in it may have been reused.
                     killAll(family(pid).union(container.map { Set(members(container: $0)) } ?? []))
                     kill(-pid, SIGKILL)
                 }
             }
-            if let container, tick % 10 == 0 { inContainer = Set(members(container: container)) }
+            if let container, tick % 4 == 0 { inContainer = Set(members(container: container)) }
             tick += 1
             usleep(5_000)
         }
@@ -162,25 +162,27 @@ public enum Runner {
         return sweep { containerPath($0).map(canonical) == want }
     }
 
-    /// Our processes (other than us) in `container`.
+    /// Every process (other than us) in `container`, whatever its uid: run as root, a scanner
+    /// could fork and setuid a child, which keeps its container but leaves our uid's list.
     static func members(container: String) -> [pid_t] {
         let want = canonical(container)
         let me = getpid()
-        return listPids(type: UInt32(PROC_UID_ONLY), arg: getuid())
+        return listPids(type: UInt32(PROC_ALL_PIDS), arg: 0)
             .filter { $0 != me && containerPath($0).map(canonical) == want }
     }
 
     /// Kill matching processes until none are left. False when they are still there after
     /// ~1 s (something keeps forking): the caller must not treat the slot as clean.
+    /// All processes, not just our uid's (see `members`); what we can't signal stays and fails it.
     static func sweep(_ matches: (pid_t) -> Bool) -> Bool {
         let me = getpid()
         for _ in 0..<200 {
-            let stray = listPids(type: UInt32(PROC_UID_ONLY), arg: getuid()).filter { $0 != me && matches($0) }
+            let stray = listPids(type: UInt32(PROC_ALL_PIDS), arg: 0).filter { $0 != me && matches($0) }
             if stray.isEmpty { return true }
             killAll(Set(stray))
             usleep(5_000)
         }
-        return listPids(type: UInt32(PROC_UID_ONLY), arg: getuid()).allSatisfy { $0 == me || !matches($0) }
+        return listPids(type: UInt32(PROC_ALL_PIDS), arg: 0).allSatisfy { $0 == me || !matches($0) }
     }
 
     static func containerPath(_ pid: pid_t) -> String? {

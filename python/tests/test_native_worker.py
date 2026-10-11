@@ -186,7 +186,7 @@ def test_a_retired_slot_makes_the_agent_unhealthy(tmp_path):
             pytest.skip(f"cannot replace the container here (macOS container protection): {e}")
         body = _qr("x", tmp_path)
         env = _gate(a.detonate(body), body, tmp_path)
-        assert env.status == "engine_error" and env.payload.fields["error"] == "slot_unclean"
+        assert env.status == "engine_error" and env.payload.fields["error"] == "no_clean_slot"
         assert (decoy / "precious").read_text() == "keep"       # not followed
         with pytest.raises(urllib.error.HTTPError) as exc:
             a.health()

@@ -242,7 +242,8 @@ resource "terraform_data" "provision" {
   triggers_replace = [
     aws_instance.mac.id,
     filemd5("${path.module}/../Package.swift"),
-    md5(join("", [for f in fileset("${path.module}/../Sources", "**/*.swift") : filemd5("${path.module}/../Sources/${f}")])),
+    # every build input, not just *.swift: wtqrk-scan links its Info.plist (Vision needs it)
+    md5(join("", [for f in fileset("${path.module}/../Sources", "**") : filemd5("${path.module}/../Sources/${f}")])),
     filemd5("${path.module}/../openapi.yaml"),
     var.wtqrk_user,
     var.wtqrk_pass,
