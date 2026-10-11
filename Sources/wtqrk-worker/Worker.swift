@@ -75,9 +75,9 @@ enum WTQRKWorker {
         if gate.ok {
             app.logger.info("wtqrk self-test passed: \(gate.detail)")
         } else {
-            // Keep serving: every job then reports engine_error (never "no QR found"), which is
-            // visible upstream; refusing /healthz would just park jobs in the queue silently.
-            app.logger.error("wtqrk self-test FAILED; every job will be engine_error: \(gate.detail)")
+            // /healthz reports NOT ready, so a static pool skips this Mac (same as blastbox's agent
+            // on macOS); a job that still arrives is engine_error, never "no QR found".
+            app.logger.error("wtqrk self-test FAILED; /healthz is 503 and jobs are engine_error: \(gate.detail)")
         }
 
         app.http.server.configuration.hostname = bind
@@ -88,8 +88,9 @@ enum WTQRKWorker {
 
         app.get("healthz") { req async -> Response in
             if let denied = agent.deny(req) { return denied }
-            return Agent.json(.ok, ["ok": true, "engine": BlastboxEnvelope.engine,
-                                    "agent": "wtqrk-worker", "self_test": gate.ok ? "passed" : "failed"])
+            return Agent.json(gate.ok ? .ok : .serviceUnavailable,
+                              ["ok": gate.ok, "engine": BlastboxEnvelope.engine,
+                               "agent": "wtqrk-worker", "self_test": gate.ok ? "passed" : "failed"])
         }
         app.on(.POST, "detonate", body: .collect(maxSize: ByteCount(value: maxBytes))) { req async -> Response in
             await agent.detonate(req)

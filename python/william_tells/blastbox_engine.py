@@ -189,6 +189,9 @@ class WilliamTellsEngine:
     """Decode QR / barcodes with Apple Vision, one sandboxed ``wtqrk-scan`` per image."""
 
     name = ENGINE_NAME
+    # Every untrusted parse runs in wtqrk-scan under select_sandbox(); this process only validates
+    # its JSON. blastbox's macOS agent requires the declaration (there's no outer boundary there).
+    sandboxed_parsing = True
     formats = frozenset({"png", "jpeg", "heic", "webp", "tiff", "gif", "bmp", "svg", "pdf"})
 
     # One self-test verdict per process (the agent is long-lived; a macOS update needs a

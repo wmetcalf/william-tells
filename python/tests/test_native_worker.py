@@ -58,6 +58,8 @@ class Agent:
             try:
                 self.health()
                 return
+            except urllib.error.HTTPError:
+                return          # up, and answering (e.g. 503 when its self-test failed)
             except OSError:
                 time.sleep(0.2)
         self.stop()
@@ -153,7 +155,10 @@ def test_a_scanner_that_cannot_be_sandboxed_fails_closed(tmp_path):
     shutil.copy("/bin/echo", fake)
     a = Agent(tmp_path, slot=951, scanner=fake)
     try:
-        assert a.health()["self_test"] == "failed"
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            a.health()
+        assert exc.value.code == 503      # a static pool skips this Mac
+        assert json.loads(exc.value.read())["self_test"] == "failed"
         body = _qr("https://native.example/should-not-matter", tmp_path)
         env = _gate(a.detonate(body), body, tmp_path)
         assert env.status == "engine_error"
