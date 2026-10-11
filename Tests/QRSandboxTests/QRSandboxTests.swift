@@ -129,6 +129,30 @@ struct SandboxedScannerTests {
         #expect(c2 == "too_large")
     }
 
+    @Test func sweepByContainerFindsTheSlotsProcesses() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let slot = try SlotProvisioner.prepare(scanner: scannerBinary()!, root: root, indices: [904])[0]
+        // A sandboxed scanner parked on a stdin that never closes, found only by its container.
+        let p = Process()
+        p.executableURL = slot.executable
+        p.arguments = ["scan", "-"]
+        let stdin = Pipe()
+        p.standardInput = stdin
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try p.run()
+        defer { try? stdin.fileHandleForWriting.close() }
+        var found = false
+        for _ in 0..<200 where !found {        // the container exists once the sandbox is up
+            found = Runner.containerPath(p.processIdentifier) != nil
+            if !found { usleep(10_000) }
+        }
+        #expect(found)
+        Runner.sweep(container: slot.containerData.path)
+        p.waitUntilExit()
+        #expect(p.terminationReason == .uncaughtSignal && p.terminationStatus == SIGKILL)
+    }
+
     @Test func aSlotWithoutTheSandboxEntitlementIsRefused() throws {
         defer { try? FileManager.default.removeItem(at: root) }
         let slot = try SlotProvisioner.prepare(scanner: scannerBinary()!, root: root, indices: [903])[0]
@@ -160,6 +184,19 @@ struct SandboxedScannerTests {
         #expect(fm.fileExists(atPath: "/etc/hosts"))           // the link was removed, not followed
     }
 
+    @Test func aSymlinkedContainerIsNotFollowed() throws {
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent("wtqrk-symlink-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: base) }
+        let victim = base.appendingPathComponent("victim")
+        try fm.createDirectory(at: victim, withIntermediateDirectories: true)
+        try Data("keep".utf8).write(to: victim.appendingPathComponent("precious"))
+        let data = base.appendingPathComponent("Data")
+        try fm.createSymbolicLink(at: data, withDestinationURL: victim)
+        #expect(throws: Container.UncleanError.self) { try Container.wipe(data) }
+        #expect(fm.fileExists(atPath: victim.appendingPathComponent("precious").path))
+    }
+
     @Test func aMissingContainerIsClean() throws {
         try Container.wipe(URL(fileURLWithPath: "/nonexistent/wtqrk-\(UUID().uuidString)"))
     }
@@ -175,5 +212,26 @@ struct SandboxedScannerTests {
         Runner.sweep(executable: exe.path)
         p.waitUntilExit()
         #expect(p.terminationReason == .uncaughtSignal && p.terminationStatus == SIGKILL)
+    }
+
+    @Test func anEscapeeHoldingThePipesCannotHangTheRun() throws {
+        // The child detaches (new session), execs another binary and lets its parent exit while
+        // still holding stdout/stderr: not in the group, not in the tree, not the same binary.
+        let tag = "wtqrk-escapee-\(UUID().uuidString)"
+        defer { _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/pkill"), arguments: ["-f", tag]) }
+        let t0 = Date()
+        let r = try Runner.run(["/bin/sh", "-c",
+                                "/usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec { \"/bin/sleep\" } \"\(tag)\", \"30\"' & /bin/sleep 0.5"],
+                               stdinFD: open("/dev/null", O_RDONLY), limits: RunLimits(timeoutSeconds: 1))
+        #expect(Date().timeIntervalSince(t0) < 10)
+        #expect(r.killed == "escaped")
+        #expect(StaticScannerOutcome.isEngineError(r))
+    }
+}
+
+enum StaticScannerOutcome {
+    static func isEngineError(_ r: RunResult) -> Bool {
+        if case .engineError(let code, _) = SandboxedScanner.outcome(r) { return code == "scanner_killed" }
+        return false
     }
 }

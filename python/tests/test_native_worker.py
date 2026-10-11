@@ -118,7 +118,7 @@ def agent(tmp_path_factory):
 def test_health_requires_the_token(agent):
     a, _ = agent
     assert a.health() == {"ok": True, "engine": "williamtells", "agent": "wtqrk-worker",
-                          "self_test": "passed"}
+                          "self_test": "passed", "slot": "ok"}
     with pytest.raises(urllib.error.HTTPError) as exc:
         a.health(token="wrong")
     assert exc.value.code == 401
@@ -166,3 +166,35 @@ def test_a_scanner_that_cannot_be_sandboxed_fails_closed(tmp_path):
         assert "payloads" not in env.payload.fields
     finally:
         a.stop()
+
+
+def test_a_retired_slot_makes_the_agent_unhealthy(tmp_path):
+    # The agent has one slot. Swap its container for a symlink (what a hostile scanner could do
+    # to its own container): the post-job wipe refuses to follow it, retires the slot, and from
+    # then on /healthz is 503 so a static pool stops sending jobs here.
+    a = Agent(tmp_path, slot=952)
+    data = Path.home() / "Library/Containers/io.github.wmetcalf.wtqrk-scan.slot952/Data"
+    try:
+        assert a.health()["slot"] == "ok"
+        decoy = tmp_path / "decoy"
+        decoy.mkdir()
+        (decoy / "precious").write_text("keep")
+        try:
+            os.rename(data, tmp_path / "real-data")
+            os.symlink(decoy, data)
+        except OSError as e:
+            pytest.skip(f"cannot replace the container here (macOS container protection): {e}")
+        body = _qr("x", tmp_path)
+        env = _gate(a.detonate(body), body, tmp_path)
+        assert env.status == "engine_error" and env.payload.fields["error"] == "slot_unclean"
+        assert (decoy / "precious").read_text() == "keep"       # not followed
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            a.health()
+        assert exc.value.code == 503
+        assert json.loads(exc.value.read())["slot"] == "retired"
+    finally:
+        a.stop()
+        if data.is_symlink():
+            data.unlink()
+        if (tmp_path / "real-data").exists():      # moved out, even if the symlink was refused
+            os.rename(tmp_path / "real-data", data)

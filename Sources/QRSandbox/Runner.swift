@@ -4,7 +4,7 @@ import Foundation
 /// What one sandboxed scanner process did.
 public struct RunResult: Sendable {
     public let exitCode: Int32          // -1 when killed by a signal
-    public let killed: String?          // "timeout" / "memory" / nil
+    public let killed: String?          // "timeout" / "memory" / "escaped" / nil
     public let stdout: Data
     public let stdoutTruncated: Bool
     public let stderr: Data
@@ -30,8 +30,10 @@ public struct RunLimits: Sendable {
 public enum Runner {
     /// Spawn `argv` with `stdinFD` as its stdin and a minimal environment, in its own process
     /// group. The child sees no other fd of ours (POSIX_SPAWN_CLOEXEC_DEFAULT). Kills the group on
-    /// timeout or when its footprint passes the cap.
-    public static func run(_ argv: [String], stdinFD: Int32, limits: RunLimits) throws -> RunResult {
+    /// timeout or when its footprint passes the cap. `container` is the App Sandbox container the
+    /// child runs in: when the child exits, every process still in that container is killed too.
+    public static func run(_ argv: [String], stdinFD: Int32, limits: RunLimits,
+                           container: String? = nil) throws -> RunResult {
         var outPipe: [Int32] = [-1, -1], errPipe: [Int32] = [-1, -1]
         guard pipe(&outPipe) == 0, pipe(&errPipe) == 0 else { throw posixError("pipe") }
         defer { for fd in outPipe + errPipe where fd >= 0 { close(fd) } }
@@ -89,9 +91,18 @@ public enum Runner {
             usleep(5_000)
         }
         // Anything the scanner left behind (it forks nothing, but a compromised one might) goes too.
+        // A child that forked, setsid()ed and let the scanner exit is in neither the group nor the
+        // tree any more, but it is still in the slot's container (and still runs the slot's binary
+        // unless it exec'd something else), so it is found by those.
         killAll(family(pid))
         kill(-pid, SIGKILL)
-        let stdout = out.finish(), stderr = err.finish()
+        if let container { sweep(container: container) }
+        sweep(executable: argv[0])
+        // Bounded: an escapee that survived the sweeps and holds the pipes must not hold this
+        // worker. Output still open past the grace period means something escaped; the run fails.
+        let drainBy = max(deadline, Date()).addingTimeInterval(2)
+        let stdout = out.finish(by: drainBy), stderr = err.finish(by: drainBy)
+        if killed == nil && (!stdout.complete || !stderr.complete) { killed = "escaped" }
         let exited = (status & 0x7f) == 0
         return RunResult(exitCode: exited ? (status >> 8) & 0xff : -1, killed: killed,
                          stdout: stdout.data, stdoutTruncated: stdout.truncated, stderr: stderr.data,
@@ -124,12 +135,34 @@ public enum Runner {
     /// to go. Run before a slot is wiped or reused: a forked scanner that escaped its process
     /// group (setsid, then orphaned) still runs the slot's binary, so it is found by path.
     public static func sweep(executable: String) {
+        sweep { pidPath($0) == executable }
+    }
+
+    /// Kill every process of ours running in the App Sandbox container `container` (its `Data`
+    /// directory). Sandbox and container survive fork and exec, so this finds an escapee even
+    /// after it detached and exec'd another binary.
+    public static func sweep(container: String) {
+        let want = canonical(container)
+        sweep { containerPath($0).map(canonical) == want }
+    }
+
+    static func sweep(_ matches: (pid_t) -> Bool) {
+        let me = getpid()
         for _ in 0..<200 {
-            let stray = listPids(type: UInt32(PROC_ALL_PIDS), arg: 0).filter { pidPath($0) == executable }
+            let stray = listPids(type: UInt32(PROC_UID_ONLY), arg: getuid()).filter { $0 != me && matches($0) }
             if stray.isEmpty { return }
             killAll(Set(stray))
             usleep(5_000)
         }
+    }
+
+    static func containerPath(_ pid: pid_t) -> String? {
+        var buf = [CChar](repeating: 0, count: 4096)
+        return sandbox_container_path_for_pid(pid, &buf, buf.count) == 0 ? String(cString: buf) : nil
+    }
+
+    static func canonical(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     static func listPids(type: UInt32, arg: UInt32) -> [pid_t] {
@@ -175,6 +208,10 @@ public enum Runner {
     }
 }
 
+/// libsystem_sandbox: the container directory of a sandboxed process (0 on success).
+@_silgen_name("sandbox_container_path_for_pid")
+func sandbox_container_path_for_pid(_ pid: pid_t, _ buffer: UnsafeMutablePointer<CChar>, _ size: Int) -> Int32
+
 /// Drains a pipe on its own thread, keeping at most `cap` bytes (the rest is read and dropped so
 /// the child never blocks on a full pipe).
 final class CappedReader: @unchecked Sendable {
@@ -183,6 +220,8 @@ final class CappedReader: @unchecked Sendable {
     private var data = Data()
     private var truncated = false
     private let done = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var stopped = false
 
     init(fd: Int32, cap: Int) {
         self.fd = fd
@@ -193,6 +232,12 @@ final class CappedReader: @unchecked Sendable {
         Thread.detachNewThread { [self] in
             var buf = [UInt8](repeating: 0, count: 64 << 10)
             while true {
+                // Poll, so a writer that never closes can't park this thread in read() forever.
+                var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                let ready = poll(&pfd, 1, 50)
+                if lock.withLock({ stopped }) { break }
+                if ready == 0 || (ready < 0 && errno == EINTR) { continue }
+                if ready < 0 { break }
                 let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
                 if n < 0 && errno == EINTR { continue }
                 if n <= 0 { break }
@@ -204,8 +249,13 @@ final class CappedReader: @unchecked Sendable {
         }
     }
 
-    func finish() -> (data: Data, truncated: Bool) {
-        done.wait()
-        return (data, truncated)
+    /// Wait for EOF until `deadline`; `complete` is false when the writer was still open then.
+    func finish(by deadline: Date) -> (data: Data, truncated: Bool, complete: Bool) {
+        let complete = done.wait(timeout: .now() + max(0, deadline.timeIntervalSinceNow)) == .success
+        if !complete {
+            lock.withLock { stopped = true }
+            done.wait()
+        }
+        return (data, truncated, complete)
     }
 }

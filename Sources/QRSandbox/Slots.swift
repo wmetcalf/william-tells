@@ -154,7 +154,16 @@ public enum Container {
     /// clean (the sandbox creates it on first launch).
     public static func wipe(_ data: URL) throws {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: data.path) else { return }
+        var st = stat()
+        guard lstat(data.path, &st) == 0 else {
+            if errno == ENOENT { return }
+            throw UncleanError(description: "cannot stat \(data.path): \(String(cString: strerror(errno)))")
+        }
+        // The scanner owns its container: it could swap `Data` for a symlink to a host directory,
+        // which a wipe that followed it would empty. Anything but a real directory retires the slot.
+        guard (st.st_mode & S_IFMT) == S_IFDIR else {
+            throw UncleanError(description: "\(data.path) is not a directory (symlink or replaced)")
+        }
         for e in try fm.contentsOfDirectory(atPath: data.path) {
             let path = data.appendingPathComponent(e).path
             if (try? fm.removeItem(atPath: path)) == nil {

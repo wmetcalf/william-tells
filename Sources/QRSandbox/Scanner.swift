@@ -45,6 +45,9 @@ public actor SandboxedScanner {
     /// Slots taken out of service because their container could not be proven clean.
     public var retiredSlots: [Int: String] { retired }
 
+    /// False once every slot is retired: no job can ever run again (until restart + prepare).
+    public var hasUsableSlot: Bool { retired.count < slots.count }
+
     // MARK: self-test gate
 
     /// Run (once) and cache the known-positive self-test. `(false, why)` disables scanning.
@@ -70,7 +73,7 @@ public actor SandboxedScanner {
     private func selfTestIn(_ slot: SandboxSlot) async -> (ok: Bool, detail: String) {
         let r: RunResult
         do {
-            r = try await Self.spawn([slot.executable.path, "self-test"], stdinPath: "/dev/null",
+            r = try await Self.spawn([slot.executable.path, "self-test"], in: slot, stdinPath: "/dev/null",
                                      limits: RunLimits(timeoutSeconds: 120))
         } catch {
             return (false, "could not start the scanner: \(error)")
@@ -113,7 +116,7 @@ public actor SandboxedScanner {
         do {
             r = try await Self.spawn([slot.executable.path, "probe", "--read", canary.path,
                                       "--connect", String(listener.port)],
-                                     stdinPath: "/dev/null", limits: RunLimits(timeoutSeconds: 30))
+                                     in: slot, stdinPath: "/dev/null", limits: RunLimits(timeoutSeconds: 30))
         } catch {
             return "could not start the probe: \(error)"
         }
@@ -158,7 +161,7 @@ public actor SandboxedScanner {
         if planCacheReady { Container.seed(slot.containerData, from: planCache) }
         let r: RunResult
         do {
-            r = try await Self.spawn(argv, stdinPath: path, limits: limits)
+            r = try await Self.spawn(argv, in: slot, stdinPath: path, limits: limits)
         } catch {
             if clean(slot) { release(slot) }
             return .engineError(code: "spawn_failed", message: "\(error)")
@@ -216,6 +219,7 @@ public actor SandboxedScanner {
     /// Kill anything still running from the slot, then empty its container. On failure the slot
     /// is retired (never handed out again) and false is returned; the caller must not release it.
     private func clean(_ slot: SandboxSlot) -> Bool {
+        Runner.sweep(container: slot.containerData.path)
         Runner.sweep(executable: slot.executable.path)
         do {
             try Container.wipe(slot.containerData)
@@ -246,7 +250,8 @@ public actor SandboxedScanner {
     }
 
     /// Run off the actor (the runner blocks), with `stdinPath` opened read-only as stdin.
-    static func spawn(_ argv: [String], stdinPath: String, limits: RunLimits) async throws -> RunResult {
+    static func spawn(_ argv: [String], in slot: SandboxSlot, stdinPath: String,
+                      limits: RunLimits) async throws -> RunResult {
         try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let fd = open(stdinPath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
@@ -255,7 +260,8 @@ public actor SandboxedScanner {
                     return
                 }
                 defer { close(fd) }
-                cont.resume(with: Result { try Runner.run(argv, stdinFD: fd, limits: limits) })
+                cont.resume(with: Result { try Runner.run(argv, stdinFD: fd, limits: limits,
+                                                          container: slot.containerData.path) })
             }
         }
     }

@@ -88,9 +88,14 @@ enum WTQRKWorker {
 
         app.get("healthz") { req async -> Response in
             if let denied = agent.deny(req) { return denied }
-            return Agent.json(gate.ok ? .ok : .serviceUnavailable,
-                              ["ok": gate.ok, "engine": BlastboxEnvelope.engine,
-                               "agent": "wtqrk-worker", "self_test": gate.ok ? "passed" : "failed"])
+            // Ready means it can run a job now: the gate passed AND its slot was not retired by a
+            // container that could not be wiped after an earlier job.
+            let slotOK = await scanner.hasUsableSlot
+            let ready = gate.ok && slotOK
+            return Agent.json(ready ? .ok : .serviceUnavailable,
+                              ["ok": ready, "engine": BlastboxEnvelope.engine, "agent": "wtqrk-worker",
+                               "self_test": gate.ok ? "passed" : "failed",
+                               "slot": slotOK ? "ok" : "retired"])
         }
         app.on(.POST, "detonate", body: .collect(maxSize: ByteCount(value: maxBytes))) { req async -> Response in
             await agent.detonate(req)
