@@ -199,8 +199,13 @@ func routes(_ app: Application, backend: ScanBackend) throws {
 
     // MARK: - Utility Endpoints
 
-    app.get("health") { req -> String in
-        return "ok"
+    // Readiness, not just liveness: the load balancer health check targets this, so an instance
+    // whose sandbox gate failed (or whose slots were all retired) leaves rotation instead of
+    // failing every job.
+    app.get("health") { req async -> Response in
+        let (ready, detail) = await backend.readiness()
+        return Response(status: ready ? .ok : .serviceUnavailable,
+                        body: .init(string: ready ? "ok" : "not ready: \(detail)"))
     }
 
     app.get("config") { req -> Response in

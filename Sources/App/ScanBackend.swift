@@ -12,11 +12,15 @@ import Vapor
 protocol ScanBackend: Sendable {
     var name: String { get }
     func scan(imageData: Data, config: MutationConfig, earlyExit: Bool) async throws -> ScanReport
+    /// Whether a scan can succeed right now (`GET /health`).
+    func readiness() async -> (ready: Bool, detail: String)
 }
 
 struct InProcessBackend: ScanBackend {
     let pool: ScannerPool
     var name: String { "inprocess (unsandboxed)" }
+
+    func readiness() async -> (ready: Bool, detail: String) { (true, "inprocess") }
 
     func scan(imageData: Data, config: MutationConfig, earlyExit: Bool) async throws -> ScanReport {
         let engine = await pool.checkout()
@@ -34,6 +38,13 @@ struct InProcessBackend: ScanBackend {
 struct SandboxedBackend: ScanBackend {
     let scanner: SandboxedScanner
     var name: String { "sandbox (App Sandbox, one process per image)" }
+
+    func readiness() async -> (ready: Bool, detail: String) {
+        let gate = await scanner.selfTest()
+        if !gate.ok { return (false, "sandbox self-test failed: \(gate.detail)") }
+        if !(await scanner.hasUsableSlot) { return (false, "every sandbox slot was retired") }
+        return (true, "sandbox")
+    }
 
     struct Failed: Error, LocalizedError {
         let code: String

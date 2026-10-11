@@ -59,8 +59,14 @@ public actor SandboxedScanner {
     }
 
     private func runSelfTest() async -> (ok: Bool, detail: String) {
-        guard let slot = await checkout() else { return (false, "no clean slot: \(retired)") }
-        guard clean(slot) else { return (false, "slot \(slot.identifier) could not be cleaned") }
+        // A slot that can't be cleaned is retired; try the next one. The gate fails only when no
+        // clean slot is left (it is cached for the process, so failing early would idle the rest).
+        var picked: SandboxSlot?
+        while picked == nil {
+            guard let slot = await checkout() else { return (false, "no clean slot: \(retired)") }
+            if clean(slot) { picked = slot }
+        }
+        let slot = picked!
         let result = await selfTestIn(slot)
         if result.ok {
             Container.capture(slot.containerData, to: planCache)
