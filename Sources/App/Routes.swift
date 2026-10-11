@@ -4,11 +4,10 @@ import QRScanCore
 
 // MARK: - Routes
 
-func routes(_ app: Application) throws {
+func routes(_ app: Application, backend: ScanBackend) throws {
     let jobStore = JobStore()
-    let scannerPool = ScannerPool(size: 8)
     let maxPending = Int(Environment.get("WTQRK_MAX_QUEUE") ?? "100") ?? 100
-    let jobQueue = JobQueue(store: jobStore, pool: scannerPool, maxPending: maxPending)
+    let jobQueue = JobQueue(store: jobStore, backend: backend, maxPending: maxPending)
 
     // Upload form UI
     app.get { req -> Response in

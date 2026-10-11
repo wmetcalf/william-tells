@@ -10,7 +10,9 @@ struct App {
         let app = try await Application.make(env)
 
         try configure(app)
-        try routes(app)
+        let backend = try await makeScanBackend(logger: app.logger)
+        app.logger.info("scan backend: \(backend.name)")
+        try routes(app, backend: backend)
         try await app.execute()
         try await app.asyncShutdown()
     }

@@ -136,15 +136,15 @@ enum QueueError: Error, AbortError {
 
 actor JobQueue {
     private let store: JobStore
-    private let pool: ScannerPool
+    private let backend: ScanBackend
     private let stream: AsyncStream<WorkItem>
     private let continuation: AsyncStream<WorkItem>.Continuation
     private var pendingCount: Int = 0
     private let maxPending: Int
 
-    init(store: JobStore, pool: ScannerPool, workerCount: Int = 8, maxPending: Int = 100) {
+    init(store: JobStore, backend: ScanBackend, workerCount: Int = 8, maxPending: Int = 100) {
         self.store = store
-        self.pool = pool
+        self.backend = backend
         self.maxPending = maxPending
 
         let (stream, continuation) = AsyncStream<WorkItem>.makeStream()
@@ -154,15 +154,14 @@ actor JobQueue {
         // Spawn worker tasks — each references self to decrement pendingCount
         let queue = self
         for _ in 0..<workerCount {
-            Task { [stream, store, pool] in
+            Task { [stream, store, backend] in
                 for await item in stream {
-                    let engine = await pool.checkout()
 
                     switch item {
                     case .single(let id, let imageData, let config, let earlyExit):
                         await store.markProcessing(id)
                         do {
-                            let report = try await engine.scan(
+                            let report = try await backend.scan(
                                 imageData: imageData,
                                 config: config,
                                 earlyExit: earlyExit
@@ -181,7 +180,7 @@ actor JobQueue {
                             var results: [BatchImageReport] = []
                             for (name, data) in images {
                                 let start = ContinuousClock.now
-                                let report = try await engine.scan(
+                                let report = try await backend.scan(
                                     imageData: data,
                                     config: config,
                                     earlyExit: earlyExit
@@ -209,7 +208,6 @@ actor JobQueue {
                         }
                     }
 
-                    await pool.checkin(engine)
                     await queue.jobCompleted()
                 }
             }

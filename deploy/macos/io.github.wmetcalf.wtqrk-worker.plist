@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for wtqrk-worker: the native (Swift) blastbox worker agent for the `williamtells`
+  engine. No Python on the Mac. Each image is scanned by a fresh wtqrk-scan process that the
+  kernel App-Sandboxes at exec; this agent never decodes an image.
+
+    swift build -c release
+    sudo install -d /opt/william-tells/bin
+    sudo install .build/release/wtqrk-worker .build/release/wtqrk-scan /opt/william-tells/bin/
+    cp io.github.wmetcalf.wtqrk-worker.plist ~/Library/LaunchAgents/      # edit the token first
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.wmetcalf.wtqrk-worker.plist
+
+  The dispatcher then lists this Mac in BLASTBOX_STATIC_WORKERS. For more concurrency on one Mac,
+  load a copy per slot with its own Label, WTQRK_WORKER_SLOT and BLASTBOX_WORKER_AGENT_PORT, and
+  list each port.
+
+  A per-user agent, not a LaunchDaemon: the Neural Engine has only been verified from a logged-in
+  user session. Run it as a dedicated user that owns nothing else.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.wmetcalf.wtqrk-worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/william-tells/bin/wtqrk-worker</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BLASTBOX_WORKER_AGENT_TOKEN</key>
+    <string>REPLACE_ME</string>
+    <!-- loopback for a Mac-only deployment; the LAN address (plus the token, and ideally
+         BLASTBOX_WORKER_AGENT_ALLOW_CIDRS=<dispatcher>/32) for a remote dispatcher -->
+    <key>BLASTBOX_WORKER_AGENT_BIND</key>
+    <string>127.0.0.1</string>
+    <key>BLASTBOX_WORKER_AGENT_PORT</key>
+    <string>8765</string>
+    <key>WTQRK_WORKER_SLOT</key>
+    <string>0</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>/tmp/wtqrk-worker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/wtqrk-worker.log</string>
+</dict>
+</plist>

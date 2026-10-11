@@ -125,6 +125,13 @@ public struct QRDetection: Codable, Sendable {
     public let symbology: String
     public let confidence: Float
     public let boundingBox: BoundingBox
+
+    public init(payload: String, symbology: String, confidence: Float, boundingBox: BoundingBox) {
+        self.payload = payload
+        self.symbology = symbology
+        self.confidence = confidence
+        self.boundingBox = boundingBox
+    }
 }
 
 public struct BoundingBox: Codable, Sendable {
@@ -132,6 +139,13 @@ public struct BoundingBox: Codable, Sendable {
     public let y: Double
     public let width: Double
     public let height: Double
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
 }
 
 // MARK: - Scan Report
@@ -140,9 +154,20 @@ public struct ScanReport: Codable, Sendable {
     public let imageDimensions: ImageDimensions
     public let mutationsTried: Int
     public let detections: [QRDetection]
+
+    public init(imageDimensions: ImageDimensions, mutationsTried: Int, detections: [QRDetection]) {
+        self.imageDimensions = imageDimensions
+        self.mutationsTried = mutationsTried
+        self.detections = detections
+    }
 }
 
 public struct ImageDimensions: Codable, Sendable {
     public let width: Int
     public let height: Int
+
+    public init(width: Int, height: Int) {
+        self.width = width
+        self.height = height
+    }
 }

@@ -25,9 +25,10 @@ For hard-to-read QR codes (low contrast, darkened, blurred), the service applies
 
 ## Quick Start
 
-> The Vapor server below decodes uploads **in-process and unsandboxed**. That's fine on your own
-> machine with your own images. For untrusted input, or to plug into Loadout, deploy the
-> [sandboxed blastbox engine](#sandboxed-scanning-with-blastbox) instead.
+> The Vapor server scans each upload in its own **App-Sandboxed `wtqrk-scan` process** (no
+> network, no file access, a fresh process per image; see [Native sandbox](#native-sandbox)).
+> `WTQRK_SCAN_BACKEND=inprocess` restores the old in-process decoding, for trusted images only.
+> To plug into Loadout or a blastbox fleet, deploy the [blastbox engine](#sandboxed-scanning-with-blastbox).
 
 ```bash
 # Build
@@ -243,21 +244,47 @@ Terraform handles the build, launchd service install, and health check automatic
 | `WTQRK_USER` | _(none)_ | Basic auth username (both must be set to enable) |
 | `WTQRK_PASS` | _(none)_ | Basic auth password |
 | `WTQRK_MAX_QUEUE` | `100` | Max pending jobs before 429 rejection |
+| `WTQRK_SCAN_BACKEND` | `sandbox` | `sandbox`: one App-Sandboxed process per image. `inprocess`: decode inside the server (trusted images only) |
+| `WTQRK_SANDBOX_SLOTS` | `4` | Concurrent sandboxed scans |
+| `WTQRK_SCAN_BIN` | next to `App` | The `wtqrk-scan` binary to sandbox |
+| `WTQRK_SLOT_ROOT` | `~/Library/Application Support/wtqrk/slots` | Where slots (signed scanner copies) live |
+
+## Native sandbox
+
+Vision, ImageIO and CoreGraphics are high-value exploit targets (FORCEDENTRY went through
+CoreGraphics, BLASTPASS through ImageIO's WebP decoder). So nothing long-lived here decodes an
+image. Each one goes to a fresh `wtqrk-scan` process that **the kernel App-Sandboxes at exec**,
+from the binary's own (ad-hoc, free) signature:
+
+- **No path grants.** The image arrives as an open file descriptor on stdin.
+- **No network, no files** outside the process's own container, which is wiped before and after
+  every image. Concurrent scans use separate slots, each with its own container.
+- **Time and memory caps**; output is validated as untrusted before anyone sees it.
+- **Self-test gate.** At startup the scanner must decode a freshly generated QR (on the Neural
+  Engine where present), report that it was sandboxed, and fail a confinement probe: it may not
+  read a canary file outside its container or connect to a loopback listener. Until that passes,
+  every scan is an error, never "no QR found" (a sandbox missing a Vision grant finds nothing
+  rather than failing).
+- **Warm plan cache.** The self-test's compiled Neural Engine plan is copied (copy-on-write) into
+  each scan's fresh container, so a scan costs ~0.1 s instead of ~0.6 s. Nothing flows back.
+
+No `sandbox-exec`, no Python. Why not XPC: launchd throttles an XPC service that exits within 10 s
+of launching, so XPC can't give each image a fresh process. The code is `Sources/QRSandbox/`
+(used by the web service and `wtqrk-worker`); slots live in
+`~/Library/Application Support/wtqrk/slots` (`WTQRK_SLOT_ROOT`), and `WTQRK_SANDBOX_SLOTS`
+(default 4) sets the web service's concurrency.
 
 ## Sandboxed scanning with blastbox
 
-Vision, ImageIO and CoreGraphics are high-value exploit targets (FORCEDENTRY went through
-CoreGraphics, BLASTPASS through ImageIO's WebP decoder), and the Vapor service above feeds them
-untrusted images **in one long-lived, unsandboxed process**. Keep it for local use. For hostile
-input, run William Tells as the [blastbox](https://github.com/wmetcalf/blastbox) engine
-`williamtells`: **one image per process, each in a fresh macOS sandbox** with the GPU and Neural
-Engine granted, and no network, no home directory, and no state carried between images. It is
-deployed like ClippyShot, RedTusk and titanarum, so [Loadout](https://github.com/wmetcalf/loadout)
-drives it the same way.
+Run William Tells as the [blastbox](https://github.com/wmetcalf/blastbox) engine `williamtells`
+to put it behind blastbox's queue, dispatcher and signed attestation. It is deployed like
+ClippyShot, RedTusk and titanarum, so [Loadout](https://github.com/wmetcalf/loadout) drives it the
+same way. The Macs run **`wtqrk-worker`**, a native Swift agent that speaks blastbox's worker
+protocol and scans through the [native sandbox](#native-sandbox).
 
 ```
-client / Loadout ──▶ blastbox serve ──▶ queue ──▶ blastbox dispatch ──▶ Mac: http_agent ──▶ seatbelt ──▶ wtqrk-scan
-                     (+ this UI)                  (static pool)         WilliamTellsEngine    (per image)
+client / Loadout ──▶ blastbox serve ──▶ queue ──▶ blastbox dispatch ──▶ Mac: wtqrk-worker ──▶ App Sandbox ──▶ wtqrk-scan
+                     (+ this UI)                  (static pool)         (Swift, no Python)    (per image)
 ```
 
 The ingress and dispatcher never decode an image; only the sandboxed `wtqrk-scan` does. They
@@ -267,7 +294,10 @@ can run on the Mac (Mac-only) or on Linux next to the other engines, with Macs a
 |---|---|
 | `Sources/wtqrk-scan/` | One-shot CLI: `scan <image>` → one JSON document on stdout; `self-test`; `render-qr`; `devices`. No Vapor. |
 | `Sources/QRScanCore/` | The scanner and models, shared by the Vapor service and the CLI. Raster input goes through an ImageIO type allowlist and a 100 M-pixel cap checked before decode. |
-| `python/william_tells/blastbox_engine.py` | The engine. Validates the CLI's (untrusted) output and maps it to a generic `Record` (`wtqrk.scan/1`). |
+| `Sources/QRSandbox/` | The native sandbox: slots, the per-image runner, the self-test/confinement gate, output validation, the blastbox envelope. |
+| `Sources/wtqrk-worker/` | Native blastbox worker agent (`GET /healthz`, `POST /detonate`). |
+| `deploy/macos/io.github.wmetcalf.wtqrk-worker.plist` | launchd agent for `wtqrk-worker`. |
+| `python/william_tells/blastbox_engine.py` | The same engine for blastbox's Python `http_agent` (seatbelt/appsandbox), if you'd rather run that. |
 | `python/william_tells/blastbox_ingress.py` + `static/` | Ingress extension: this web UI at `/` and `/jobs/<id>`, on top of the core `/v1/jobs` API. |
 | `deploy/blastbox/williamtells-host.env.example` | Ingress + dispatcher config (one file both source). |
 | `deploy/blastbox/williamtells-worker.env.example` | Mac worker-agent config. |
@@ -275,18 +305,18 @@ can run on the Mac (Mac-only) or on Linux next to the other engines, with Macs a
 ### Install a Mac worker
 
 ```bash
-swift build -c release                              # builds App and wtqrk-scan
-.build/release/wtqrk-scan self-test                 # decodes a generated QR (on the ANE when present)
-
-pip install -e python/                              # pulls in blastbox[host]
-blastbox macos doctor --backend seatbelt --accelerator gpu --accelerator ane \
-    -- "$PWD/.build/release/wtqrk-scan" self-test   # sandbox confines AND the scanner works in it
+swift build -c release                              # App, wtqrk-scan, wtqrk-worker
+sudo install -d /opt/william-tells/bin
+sudo install .build/release/wtqrk-worker .build/release/wtqrk-scan /opt/william-tells/bin/
+cp deploy/macos/io.github.wmetcalf.wtqrk-worker.plist ~/Library/LaunchAgents/   # set the token
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.wmetcalf.wtqrk-worker.plist
+grep "self-test passed" /tmp/wtqrk-worker.log       # the gate ran on this Mac
 ```
 
-Then run the agent with `williamtells-worker.env.example` in blastbox's
-`deploy/macos/io.blastbox.worker-agent.plist`. For a Mac-only deployment, also load
-`io.blastbox.ingress.plist` and `io.blastbox.dispatcher.plist` from the same directory, both
-pointed at your copy of `williamtells-host.env.example`.
+The ingress and dispatcher run wherever your other blastbox engines do. For a Mac-only
+deployment, load blastbox's `deploy/macos/io.blastbox.ingress.plist` and
+`io.blastbox.dispatcher.plist` (`pip install -e python/` gives you blastbox), both pointed at your
+copy of `williamtells-host.env.example`.
 
 ### Use it
 
@@ -304,15 +334,13 @@ Job params (allowlisted on the dispatcher), each sent as its own `params=KEY=VAL
 **Loadout.** Loadout talks to the ingress (`LOADOUT_WILLIAMTELLS_URL=http://HOST:8005`), maps its
 `mode` setting to `WTQRK_MODE`, and turns each decoded payload into a `url` or `qr_code` artifact.
 
-**Self-test gate.** If a sandbox grant goes missing, Vision usually doesn't fail; it returns *no
-detections*. The engine runs `wtqrk-scan self-test` in the same sandbox before trusting any
-result, and returns `engine_error` (never "no QR found") for every job while it fails. Run
-`blastbox macos doctor` after every macOS update.
+**Self-test gate.** A job on a Mac whose gate failed is `engine_error` (`self_test_failed`),
+never "no QR found"; `/healthz` reports `"self_test": "failed"`. The gate runs at every agent
+start, so restart the agent after a macOS update.
 
-**Latency** (M4 Pro, macOS 26.6, one QR PNG): 87 ms unsandboxed; 153 ms under `seatbelt`; 95 ms
-under `appsandbox`; about 270 ms end to end through ingress, dispatcher and agent. The self-test
-builds a Neural Engine plan cache once; each job gets a copy-on-write clone of it, and nothing
-flows back.
+**Latency** (M4 Pro, macOS 26.6, one QR PNG): 87 ms decoding in-process; about 105 ms in a fresh
+App-Sandboxed process; about 135 ms per request at `wtqrk-worker`. (Python `http_agent`:
+153 ms under `seatbelt`, 95 ms under `appsandbox`.)
 
 ## License
 

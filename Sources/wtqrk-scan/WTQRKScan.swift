@@ -5,47 +5,21 @@
 // stdout, needs no network and no writable path except $TMPDIR, and exits. No Vapor, no
 // long-lived state, nothing shared between images.
 //
-//   wtqrk-scan scan <image> [--heavy] [--config-json JSON] [--compute auto|ane|gpu|cpu]
+//   wtqrk-scan scan <image|-> [--heavy] [--config-json JSON] [--compute auto|ane|gpu|cpu]
 //                           [--max-bytes N]
 //   wtqrk-scan self-test [--compute auto|ane|gpu|cpu]
 //   wtqrk-scan devices
+//   wtqrk-scan probe --read <path> --connect <port>   (confinement check for a sandbox host)
 //   wtqrk-scan render-qr <message> <out.png>     (a known-positive sample for tests / ops)
+//
+// `scan -` reads the image from stdin: the native sandbox host hands each scan an open file
+// descriptor, so the sandboxed process needs no file-path grant at all.
 //
 // Exit codes: 0 scanned (detections may be empty) / self-test passed; 1 internal or self-test
 // failure; 2 the input is not a usable image; 3 bad config; 64 usage.
 
-import AppKit
-import CoreImage
 import Foundation
 import QRScanCore
-
-let schema = "wtqrk.scan/1"
-
-enum Exit: Int32 { case ok = 0, failure = 1, badInput = 2, badConfig = 3, usage = 64 }
-
-struct ErrorBody: Encodable { let code: String; let message: String }
-struct ScanOutput: Encodable {
-    let schema: String
-    let ok: Bool
-    let mode: String?
-    let compute: String?
-    let report: ScanReport?
-    let error: ErrorBody?
-}
-struct SelfTestCase: Encodable {
-    let compute: String
-    let ok: Bool
-    let expected: String
-    let got: [String]
-    let error: String?
-    let ms: Int
-}
-struct SelfTestOutput: Encodable {
-    let schema: String
-    let ok: Bool
-    let devices: [String]
-    let cases: [SelfTestCase]
-}
 
 /// The ONLY channel for our JSON. Apple frameworks (E5RT, Espresso) print diagnostics straight
 /// to fd 1; if our document shared it, one framework message would corrupt the output. So at
@@ -71,15 +45,15 @@ func emit<T: Encodable>(_ value: T) {
     }
 }
 
-func fail(_ code: String, _ message: String, _ exit: Exit, mode: String? = nil) -> Exit {
-    emit(ScanOutput(schema: schema, ok: false, mode: mode, compute: nil, report: nil,
-                    error: ErrorBody(code: code, message: message)))
+func fail(_ code: String, _ message: String, _ exit: ScanExit, mode: String? = nil) -> ScanExit {
+    emit(ScanOutput(schema: scanSchema, ok: false, mode: mode, compute: nil, report: nil,
+                    error: ScanErrorBody(code: code, message: message)))
     return exit
 }
 
-func usage() -> Exit {
+func usage() -> ScanExit {
     FileHandle.standardError.write(Data("""
-    usage: wtqrk-scan scan <image> [--heavy] [--config-json JSON] [--compute auto|ane|gpu|cpu] [--max-bytes N]
+    usage: wtqrk-scan scan <image|-> [--heavy] [--config-json JSON] [--compute auto|ane|gpu|cpu] [--max-bytes N]
            wtqrk-scan self-test [--compute auto|ane|gpu|cpu]
            wtqrk-scan devices
            wtqrk-scan render-qr <message> <out.png>
@@ -116,7 +90,33 @@ func parseCompute(_ raw: String?) -> ComputePreference? {
     return ComputePreference(rawValue: raw)
 }
 
-func runScan(_ argv: ArraySlice<String>) async -> Exit {
+enum ReadError: Error { case tooLarge(Int), notRegular, io(String) }
+
+/// Read at most `maxBytes` (one more byte means "too large") from an fd.
+func readCapped(fd: Int32, maxBytes: Int) throws -> Data {
+    var data = Data()
+    var buf = [UInt8](repeating: 0, count: 1 << 20)
+    while true {
+        let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+        if n < 0 {
+            if errno == EINTR { continue }
+            throw ReadError.io(String(cString: strerror(errno)))
+        }
+        if n == 0 { return data }
+        data.append(buf, count: n)
+        if data.count > maxBytes { throw ReadError.tooLarge(data.count) }
+    }
+}
+
+func readInput(_ path: String, maxBytes: Int) throws -> Data {
+    if path == "-" { return try readCapped(fd: STDIN_FILENO, maxBytes: maxBytes) }
+    let attrs = try FileManager.default.attributesOfItem(atPath: path)
+    guard (attrs[.type] as? FileAttributeType) == .typeRegular else { throw ReadError.notRegular }
+    if let size = attrs[.size] as? Int, size > maxBytes { throw ReadError.tooLarge(size) }
+    return try Data(contentsOf: URL(fileURLWithPath: path), options: [.uncached])
+}
+
+func runScan(_ argv: ArraySlice<String>) async -> ScanExit {
     guard let args = Args(argv, valued: ["--config-json", "--compute", "--max-bytes"],
                           booleans: ["--heavy"]),
           args.positional.count == 1,
@@ -127,101 +127,74 @@ func runScan(_ argv: ArraySlice<String>) async -> Exit {
     let mode = heavy ? "heavy" : "default"
     let maxBytes = Int(args.options["--max-bytes"] ?? "") ?? 50 * 1024 * 1024
 
-    var config = heavy ? MutationConfig.heavy : MutationConfig.default
-    if let raw = args.options["--config-json"] {
-        do {
-            config = try JSONDecoder().decode(MutationConfig.self, from: Data(raw.utf8)).validated()
-        } catch {
-            return fail("bad_config", "\(error.localizedDescription)", .badConfig, mode: mode)
-        }
-    }
-
-    let url = URL(fileURLWithPath: args.positional[0])
     let data: Data
     do {
-        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
-        guard (attrs[.type] as? FileAttributeType) == .typeRegular else {
-            return fail("bad_input", "not a regular file", .badInput, mode: mode)
-        }
-        if let size = attrs[.size] as? Int, size > maxBytes {
-            return fail("too_large", "input is \(size) bytes; limit \(maxBytes)", .badInput, mode: mode)
-        }
-        data = try Data(contentsOf: url, options: [.uncached])
+        data = try readInput(args.positional[0], maxBytes: maxBytes)
+    } catch ReadError.tooLarge(let n) {
+        return fail("too_large", "input is at least \(n) bytes; limit \(maxBytes)", .badInput, mode: mode)
+    } catch ReadError.notRegular {
+        return fail("bad_input", "not a regular file", .badInput, mode: mode)
     } catch {
-        return fail("unreadable", error.localizedDescription, .badInput, mode: mode)
+        return fail("unreadable", "\(error)", .badInput, mode: mode)
     }
 
-    do {
-        // Same early-exit semantics as the web API: /scan stops at the first hit, /scan/heavy sweeps.
-        let report = try await QRScannerEngine(compute: compute)
-            .scan(imageData: data, config: config, earlyExit: !heavy)
-        emit(ScanOutput(schema: schema, ok: true, mode: mode, compute: compute.rawValue,
-                        report: report, error: nil))
-        return .ok
-    } catch let error as ScanError {
-        return fail("invalid_image", error.localizedDescription, .badInput, mode: mode)
-    } catch {
-        return fail("scan_failed", "\(error.localizedDescription)", .failure, mode: mode)
-    }
+    let (out, code) = await ScanJob.scan(data: data, heavy: heavy,
+                                         configJSON: args.options["--config-json"], compute: compute)
+    emit(out)
+    return code
 }
 
-/// Render a QR for `message` to PNG bytes — exercised through the real ImageIO load path.
-func qrPNG(_ message: String) -> Data? {
-    guard let gen = CIFilter(name: "CIQRCodeGenerator") else { return nil }
-    gen.setValue(Data(message.utf8), forKey: "inputMessage")
-    gen.setValue("M", forKey: "inputCorrectionLevel")
-    guard let qr = gen.outputImage else { return nil }
-    // 10x scale plus a white quiet zone, like a code on a screen.
-    let scaled = qr.transformed(by: CGAffineTransform(scaleX: 10, y: 10))
-    let pad: CGFloat = 40
-    let canvas = CIImage(color: .white).cropped(to: scaled.extent.insetBy(dx: -pad, dy: -pad))
-    let composed = scaled.composited(over: canvas)
-    let ctx = CIContext(options: [.useSoftwareRenderer: false])
-    guard let cs = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
-    return ctx.pngRepresentation(of: composed, format: .RGBA8, colorSpace: cs)
-}
+/// `sandbox_check(getpid(), NULL, SANDBOX_FILTER_NONE)`: nonzero when the kernel has this process
+/// sandboxed. (libsystem_sandbox; called without variadic arguments, so the C ABI is plain.)
+@_silgen_name("sandbox_check")
+func sandbox_check(_ pid: pid_t, _ operation: UnsafePointer<CChar>?, _ type: Int32) -> Int32
 
-func runSelfTest(_ argv: ArraySlice<String>) async -> Exit {
+func runSelfTest(_ argv: ArraySlice<String>) async -> ScanExit {
     guard let args = Args(argv, valued: ["--compute"], booleans: []),
           args.positional.isEmpty
     else { return usage() }
-
-    let devices = QRScannerEngine.availableComputeDevices()
-    var prefs: [ComputePreference]
+    var compute: ComputePreference?
     if let raw = args.options["--compute"] {
         guard let p = ComputePreference(rawValue: raw) else { return usage() }
-        prefs = [p]
-    } else {
-        // Default: what jobs use (auto) AND, when the hardware has one, the Neural Engine
-        // explicitly — so a sandbox that silently blocks the ANE cannot pass on a fallback.
-        prefs = [.auto]
-        if devices.contains("ane") { prefs.append(.ane) }
+        compute = p
     }
+    let out = await ScanJob.selfTest(compute: compute,
+                                     sandboxed: sandbox_check(getpid(), nil, 0) != 0)
+    emit(out)
+    return out.ok ? .ok : .failure
+}
 
-    var cases: [SelfTestCase] = []
-    for pref in prefs {
-        let expected = "https://wtqrk.self-test/\(UUID().uuidString)"
-        let t0 = Date()
-        var got: [String] = []
-        var err: String?
-        if let png = qrPNG(expected) {
-            do {
-                let report = try await QRScannerEngine(compute: pref)
-                    .scan(imageData: png, config: .default, earlyExit: true)
-                got = report.detections.map(\.payload)
-            } catch {
-                err = error.localizedDescription
-            }
-        } else {
-            err = "could not render the test QR"
+struct ProbeOutput: Encodable {
+    let schema = "wtqrk.probe/1"
+    let sandboxed: Bool
+    let readDenied: Bool
+    let connectDenied: Bool
+}
+
+/// Try what a confined scanner must NOT be able to do: read a file the host created outside the
+/// container, and connect to a listener the host opened on loopback. Run on trusted arguments
+/// only; the host reads the answers as a confinement check, alongside its own listener's view.
+func runProbe(_ argv: ArraySlice<String>) -> ScanExit {
+    guard let args = Args(argv, valued: ["--read", "--connect"], booleans: []),
+          let path = args.options["--read"], let port = UInt16(args.options["--connect"] ?? "")
+    else { return usage() }
+    let fd = open(path, O_RDONLY)
+    let readDenied = fd < 0
+    if fd >= 0 { close(fd) }
+    let s = socket(AF_INET, SOCK_STREAM, 0)
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = port.bigEndian
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+    let rc = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            connect(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
         }
-        cases.append(SelfTestCase(compute: pref.rawValue, ok: got.contains(expected),
-                                  expected: expected, got: got, error: err,
-                                  ms: Int(Date().timeIntervalSince(t0) * 1000)))
     }
-    let ok = !cases.isEmpty && cases.allSatisfy(\.ok)
-    emit(SelfTestOutput(schema: "wtqrk.self-test/1", ok: ok, devices: devices, cases: cases))
-    return ok ? .ok : .failure
+    close(s)
+    emit(ProbeOutput(sandboxed: sandbox_check(getpid(), nil, 0) != 0, readDenied: readDenied,
+                     connectDenied: rc != 0))
+    return .ok
 }
 
 @main
@@ -229,18 +202,19 @@ struct WTQRKScan {
     static func main() async {
         _ = resultFD   // claim the real stdout before any framework can write to it
         let argv = CommandLine.arguments
-        let code: Exit
+        let code: ScanExit
         switch argv.dropFirst().first {
         case "scan": code = await runScan(argv.dropFirst(2))
         case "self-test": code = await runSelfTest(argv.dropFirst(2))
         case "render-qr":
             let rest = Array(argv.dropFirst(2))
-            if rest.count == 2, let png = qrPNG(rest[0]),
+            if rest.count == 2, let png = ScanJob.qrPNG(rest[0]),
                (try? png.write(to: URL(fileURLWithPath: rest[1]))) != nil {
                 code = .ok
             } else {
                 code = rest.count == 2 ? .failure : usage()
             }
+        case "probe": code = runProbe(argv.dropFirst(2))
         case "devices":
             emit(["devices": QRScannerEngine.availableComputeDevices()])
             code = .ok

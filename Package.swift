@@ -13,6 +13,7 @@ let package = Package(
     products: [
         .executable(name: "App", targets: ["App"]),
         .executable(name: "wtqrk-scan", targets: ["wtqrk-scan"]),
+        .executable(name: "wtqrk-worker", targets: ["wtqrk-worker"]),
     ],
     dependencies: [
         .package(url: "https://github.com/vapor/vapor.git", from: "4.89.0"),
@@ -38,10 +39,27 @@ let package = Package(
                 ]),
             ]
         ),
+        // Native macOS sandbox host: one App-Sandboxed wtqrk-scan process per image (no
+        // sandbox-exec, no Python). Used by wtqrk-worker and by the web service.
+        .target(
+            name: "QRSandbox",
+            dependencies: ["QRScanCore"],
+            path: "Sources/QRSandbox"
+        ),
+        // Native blastbox worker agent (the http_agent protocol) for a Mac in a `static` pool.
+        .executableTarget(
+            name: "wtqrk-worker",
+            dependencies: [
+                "QRSandbox",
+                .product(name: "Vapor", package: "vapor"),
+            ],
+            path: "Sources/wtqrk-worker"
+        ),
         .executableTarget(
             name: "App",
             dependencies: [
                 "QRScanCore",
+                "QRSandbox",
                 .product(name: "Vapor", package: "vapor"),
             ],
             path: "Sources/App"
@@ -50,6 +68,11 @@ let package = Package(
             name: "QRScanCoreTests",
             dependencies: ["QRScanCore"],
             path: "Tests/QRScanCoreTests"
+        ),
+        .testTarget(
+            name: "QRSandboxTests",
+            dependencies: ["QRSandbox"],
+            path: "Tests/QRSandboxTests"
         ),
     ]
 )
