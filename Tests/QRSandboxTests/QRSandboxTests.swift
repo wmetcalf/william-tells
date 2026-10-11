@@ -214,6 +214,24 @@ struct SandboxedScannerTests {
         #expect(p.terminationReason == .uncaughtSignal && p.terminationStatus == SIGKILL)
     }
 
+    @Test func everyChildIsEnumeratedPastTheFirstBuffer() throws {
+        // 300 direct children: more than one 256-entry buffer, all of which the memory cap counts.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+        p.arguments = ["-e", "for (1..300) { exit 0 unless defined(my $k = fork); if (!$k) { sleep 30; exit 0 } } sleep 30"]
+        try p.run()
+        defer { killpg(p.processIdentifier, SIGKILL); kill(p.processIdentifier, SIGKILL); p.waitUntilExit() }
+        _ = setpgid(p.processIdentifier, p.processIdentifier)
+        var n = 0
+        for _ in 0..<300 where n < 300 {
+            n = Runner.childPids(p.processIdentifier).count
+            if n < 300 { usleep(10_000) }
+        }
+        let children = Runner.childPids(p.processIdentifier)
+        #expect(children.count == 300)
+        Runner.killAll(Set(children))
+    }
+
     @Test func anEscapeeHoldingThePipesCannotHangTheRun() throws {
         // The child detaches (new session), execs another binary and lets its parent exit while
         // still holding stdout/stderr: not in the group, not in the tree, not the same binary.

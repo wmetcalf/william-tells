@@ -225,8 +225,11 @@ public actor SandboxedScanner {
     /// Kill anything still running from the slot, then empty its container. On failure the slot
     /// is retired (never handed out again) and false is returned; the caller must not release it.
     private func clean(_ slot: SandboxSlot) -> Bool {
-        Runner.sweep(container: slot.containerData.path)
-        Runner.sweep(executable: slot.executable.path)
+        guard Runner.sweep(container: slot.containerData.path),
+              Runner.sweep(executable: slot.executable.path) else {
+            retire(slot, why: "processes in the slot could not all be killed")
+            return false
+        }
         do {
             try Container.wipe(slot.containerData)
             return true

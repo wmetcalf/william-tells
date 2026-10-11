@@ -74,6 +74,11 @@ public enum Runner {
         var killed: String?
         var status: Int32 = 0
         let deadline = t0.addingTimeInterval(limits.timeoutSeconds)
+        // Everything in the slot's container counts toward the cap, so a child that left the
+        // process group and tree (an intermediate + setsid) is still metered. Rescanned every
+        // ~50 ms (it walks all of our processes); the group and tree every 5 ms.
+        var inContainer: Set<pid_t> = []
+        var tick = 0
         while true {
             let w = waitpid(pid, &status, WNOHANG)
             if w == pid { break }
@@ -81,23 +86,32 @@ public enum Runner {
             if killed == nil {
                 if Date() >= deadline {
                     killed = "timeout"
-                } else if footprint(of: family(pid)) > limits.maxFootprintBytes {
+                } else if footprint(of: family(pid).union(inContainer)) > limits.maxFootprintBytes {
                     // The cap is for the whole job: a compromised scanner that forks can't spread
                     // its allocation across children to stay under it.
                     killed = "memory"
                 }
-                if killed != nil { killAll(family(pid)); kill(-pid, SIGKILL) }
+                if killed != nil {
+                    // Fresh, not the ~50 ms-old snapshot: a pid in it may have been reused.
+                    killAll(family(pid).union(container.map { Set(members(container: $0)) } ?? []))
+                    kill(-pid, SIGKILL)
+                }
             }
+            if let container, tick % 10 == 0 { inContainer = Set(members(container: container)) }
+            tick += 1
             usleep(5_000)
         }
         // Anything the scanner left behind (it forks nothing, but a compromised one might) goes too.
         // A child that forked, setsid()ed and let the scanner exit is in neither the group nor the
         // tree any more, but it is still in the slot's container (and still runs the slot's binary
-        // unless it exec'd something else), so it is found by those.
+        // unless it exec'd something else), so it is found by those. A sweep that can't empty
+        // the container (something keeps forking) fails the run.
         killAll(family(pid))
         kill(-pid, SIGKILL)
-        if let container { sweep(container: container) }
-        sweep(executable: argv[0])
+        // Only for a slot run: argv[0] is then the slot's own binary, never a shared one like
+        // /bin/sh whose other users must not be swept.
+        let swept = container.map { sweep(container: $0) && sweep(executable: argv[0]) } ?? true
+        if killed == nil && !swept { killed = "escaped" }
         // Bounded: an escapee that survived the sweeps and holds the pipes must not hold this
         // worker. Output still open past the grace period means something escaped; the run fails.
         let drainBy = max(deadline, Date()).addingTimeInterval(2)
@@ -134,26 +148,39 @@ public enum Runner {
     /// Kill every process whose executable is `executable` (a slot's scanner), and wait for them
     /// to go. Run before a slot is wiped or reused: a forked scanner that escaped its process
     /// group (setsid, then orphaned) still runs the slot's binary, so it is found by path.
-    public static func sweep(executable: String) {
+    @discardableResult
+    public static func sweep(executable: String) -> Bool {
         sweep { pidPath($0) == executable }
     }
 
     /// Kill every process of ours running in the App Sandbox container `container` (its `Data`
     /// directory). Sandbox and container survive fork and exec, so this finds an escapee even
     /// after it detached and exec'd another binary.
-    public static func sweep(container: String) {
+    @discardableResult
+    public static func sweep(container: String) -> Bool {
         let want = canonical(container)
-        sweep { containerPath($0).map(canonical) == want }
+        return sweep { containerPath($0).map(canonical) == want }
     }
 
-    static func sweep(_ matches: (pid_t) -> Bool) {
+    /// Our processes (other than us) in `container`.
+    static func members(container: String) -> [pid_t] {
+        let want = canonical(container)
+        let me = getpid()
+        return listPids(type: UInt32(PROC_UID_ONLY), arg: getuid())
+            .filter { $0 != me && containerPath($0).map(canonical) == want }
+    }
+
+    /// Kill matching processes until none are left. False when they are still there after
+    /// ~1 s (something keeps forking): the caller must not treat the slot as clean.
+    static func sweep(_ matches: (pid_t) -> Bool) -> Bool {
         let me = getpid()
         for _ in 0..<200 {
             let stray = listPids(type: UInt32(PROC_UID_ONLY), arg: getuid()).filter { $0 != me && matches($0) }
-            if stray.isEmpty { return }
+            if stray.isEmpty { return true }
             killAll(Set(stray))
             usleep(5_000)
         }
+        return listPids(type: UInt32(PROC_UID_ONLY), arg: getuid()).allSatisfy { $0 == me || !matches($0) }
     }
 
     static func containerPath(_ pid: pid_t) -> String? {
@@ -174,9 +201,15 @@ public enum Runner {
     }
 
     static func childPids(_ pid: pid_t) -> [pid_t] {
-        var buf = [pid_t](repeating: 0, count: 256)
-        let got = buf.withUnsafeMutableBytes { proc_listchildpids(pid, $0.baseAddress, Int32($0.count)) }
-        return Array(buf.prefix(max(0, Int(got)))).filter { $0 > 0 }
+        // The call fills only the buffer it is given: grow until the answer fits, so a scanner
+        // with many children can't push some of them out of the accounting.
+        var cap = 256
+        while true {
+            var buf = [pid_t](repeating: 0, count: cap)
+            let got = Int(buf.withUnsafeMutableBytes { proc_listchildpids(pid, $0.baseAddress, Int32($0.count)) })
+            if got < cap || cap >= 1 << 16 { return Array(buf.prefix(max(0, min(got, cap)))).filter { $0 > 0 } }
+            cap *= 4
+        }
     }
 
     static func pidPath(_ pid: pid_t) -> String? {
