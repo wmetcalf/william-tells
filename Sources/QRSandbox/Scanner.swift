@@ -28,7 +28,8 @@ public enum ScanOutcome: Sendable {
 public actor SandboxedScanner {
     public nonisolated let slots: [SandboxSlot]
     private var free: [SandboxSlot]
-    private var waiters: [CheckedContinuation<SandboxSlot, Never>] = []
+    private var retired: [Int: String] = [:]          // slot index -> why it can't be reused
+    private var waiters: [CheckedContinuation<SandboxSlot?, Never>] = []
     private let planCache: URL
     private var planCacheReady = false
     private var gate: Task<(ok: Bool, detail: String), Never>?
@@ -41,6 +42,9 @@ public actor SandboxedScanner {
                                                 isDirectory: true)
     }
 
+    /// Slots taken out of service because their container could not be proven clean.
+    public var retiredSlots: [Int: String] { retired }
+
     // MARK: self-test gate
 
     /// Run (once) and cache the known-positive self-test. `(false, why)` disables scanning.
@@ -52,9 +56,18 @@ public actor SandboxedScanner {
     }
 
     private func runSelfTest() async -> (ok: Bool, detail: String) {
-        let slot = await checkout()
-        defer { checkin(slot) }
-        Container.wipe(slot.containerData)
+        guard let slot = await checkout() else { return (false, "no clean slot: \(retired)") }
+        guard clean(slot) else { return (false, "slot \(slot.identifier) could not be cleaned") }
+        let result = await selfTestIn(slot)
+        if result.ok {
+            Container.capture(slot.containerData, to: planCache)
+            planCacheReady = true
+        }
+        if clean(slot) { release(slot) }
+        return result
+    }
+
+    private func selfTestIn(_ slot: SandboxSlot) async -> (ok: Bool, detail: String) {
         let r: RunResult
         do {
             r = try await Self.spawn([slot.executable.path, "self-test"], stdinPath: "/dev/null",
@@ -66,18 +79,13 @@ public actor SandboxedScanner {
             + String(decoding: r.stderr.suffix(500), as: UTF8.self)
         guard r.killed == nil, r.exitCode == 0,
               let out = try? JSONDecoder().decode(SelfTestOutput.self, from: r.stdout), out.ok
-        else { Container.wipe(slot.containerData); return (false, detail) }
+        else { return (false, detail) }
         guard out.sandboxed == true else {
-            Container.wipe(slot.containerData)
             return (false, "the scanner decoded the test QR but was NOT sandboxed (slot \(slot.identifier))")
         }
         if let why = await probeConfinement(slot) {
-            Container.wipe(slot.containerData)
             return (false, "confinement probe failed in \(slot.identifier): \(why)")
         }
-        Container.capture(slot.containerData, to: planCache)
-        planCacheReady = true
-        Container.wipe(slot.containerData)
         return (true, "self-test passed in \(slot.identifier) (\(r.elapsedMs) ms)")
     }
 
@@ -88,7 +96,16 @@ public actor SandboxedScanner {
         // which is why a slot dir holds nothing but the scanner and inputs never go there.
         let canary = slot.executable.deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("canary-\(slot.index)")
-        try? Data("wtqrk confinement canary\n".utf8).write(to: canary)
+        let marker = Data("wtqrk confinement canary \(UUID().uuidString)\n".utf8)
+        // The read check proves nothing unless the canary really exists and is readable to an
+        // unconfined process: a missing canary would make even an unsandboxed probe say "denied".
+        do {
+            try? FileManager.default.removeItem(at: canary)
+            try marker.write(to: canary)
+            guard try Data(contentsOf: canary) == marker else { return "could not create the canary" }
+        } catch {
+            return "could not create the canary \(canary.path): \(error)"
+        }
         defer { try? FileManager.default.removeItem(at: canary) }
         guard let listener = LoopbackListener() else { return "could not open a loopback listener" }
         defer { listener.close() }
@@ -129,22 +146,33 @@ public actor SandboxedScanner {
             catch { return .rejected(code: "bad_config", message: "\(error)") }
         }
 
-        let slot = await checkout()
-        defer { checkin(slot) }
+        guard let slot = await checkout() else {
+            return .engineError(code: "no_clean_slot",
+                                message: "every sandbox slot was retired: \(retired)")
+        }
+        guard clean(slot) else {
+            return .engineError(code: "slot_unclean",
+                                message: "slot \(slot.identifier) could not be cleaned and was retired")
+        }
         argv[0] = slot.executable.path
-        Container.wipe(slot.containerData)
         if planCacheReady { Container.seed(slot.containerData, from: planCache) }
-        defer { Container.wipe(slot.containerData) }
-
         let r: RunResult
         do {
             r = try await Self.spawn(argv, stdinPath: path, limits: limits)
         } catch {
+            if clean(slot) { release(slot) }
             return .engineError(code: "spawn_failed", message: "\(error)")
         }
+        // Clean up BEFORE answering: a slot whose container can't be emptied after this job is
+        // retired, and this job's answer is still the scanner's (judged below like any other).
+        if clean(slot) { release(slot) }
+        return Self.outcome(r)
+    }
+
+    static func outcome(_ r: RunResult) -> ScanOutcome {
+        func tail(_ d: Data) -> String { String(decoding: d.suffix(500), as: UTF8.self) }
         if let why = r.killed {
-            return .engineError(code: "scanner_killed",
-                                message: "scanner killed (\(why)): " + tail(r.stderr))
+            return .engineError(code: "scanner_killed", message: "scanner killed (\(why)): " + tail(r.stderr))
         }
         if r.stdoutTruncated {
             return .engineError(code: "bad_scanner_output", message: "scanner output exceeded its cap")
@@ -185,16 +213,37 @@ public actor SandboxedScanner {
 
     // MARK: slots
 
-    private func checkout() async -> SandboxSlot {
+    /// Kill anything still running from the slot, then empty its container. On failure the slot
+    /// is retired (never handed out again) and false is returned; the caller must not release it.
+    private func clean(_ slot: SandboxSlot) -> Bool {
+        Runner.sweep(executable: slot.executable.path)
+        do {
+            try Container.wipe(slot.containerData)
+            return true
+        } catch {
+            retire(slot, why: "\(error)")
+            return false
+        }
+    }
+
+    /// nil when no slot can ever be handed out (all retired).
+    private func checkout() async -> SandboxSlot? {
         if let s = free.popLast() { return s }
+        if retired.count == slots.count { return nil }
         return await withCheckedContinuation { waiters.append($0) }
     }
 
-    private func checkin(_ slot: SandboxSlot) {
+    private func release(_ slot: SandboxSlot) {
         if !waiters.isEmpty { waiters.removeFirst().resume(returning: slot) } else { free.append(slot) }
     }
 
-    private func tail(_ d: Data) -> String { String(decoding: d.suffix(500), as: UTF8.self) }
+    private func retire(_ slot: SandboxSlot, why: String) {
+        retired[slot.index] = why
+        if retired.count == slots.count {
+            for w in waiters { w.resume(returning: nil) }
+            waiters.removeAll()
+        }
+    }
 
     /// Run off the actor (the runner blocks), with `stdinPath` opened read-only as stdin.
     static func spawn(_ argv: [String], stdinPath: String, limits: RunLimits) async throws -> RunResult {

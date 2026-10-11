@@ -142,12 +142,45 @@ public enum SlotProvisioner {
 
 /// Container hygiene. The host is NOT sandboxed, so it can empty and refill a slot's container.
 public enum Container {
+    public struct UncleanError: Error, CustomStringConvertible {
+        public let description: String
+    }
+
     /// Remove everything inside `data` (not `data` itself: the container's own metadata lives
-    /// beside it and is protected).
-    public static func wipe(_ data: URL) {
+    /// beside it and is protected), and PROVE it is empty. The scanner owns these files, so a
+    /// compromised one can lock them (chmod 000 dirs, `uchg` immutable flags) to leave state for
+    /// the next image; those get unlocked and removed, and anything still there is an error --
+    /// the caller retires the slot rather than reuse a dirty container. A missing `data` is
+    /// clean (the sandbox creates it on first launch).
+    public static func wipe(_ data: URL) throws {
         let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(atPath: data.path) else { return }
-        for e in entries { try? fm.removeItem(at: data.appendingPathComponent(e)) }
+        guard fm.fileExists(atPath: data.path) else { return }
+        for e in try fm.contentsOfDirectory(atPath: data.path) {
+            let path = data.appendingPathComponent(e).path
+            if (try? fm.removeItem(atPath: path)) == nil {
+                unlock(path)
+                try? fm.removeItem(atPath: path)
+            }
+        }
+        let left = try fm.contentsOfDirectory(atPath: data.path)
+        guard left.isEmpty else {
+            throw UncleanError(description: "could not empty \(data.path): \(left.prefix(5))")
+        }
+    }
+
+    /// Clear user flags and restore owner permissions under `path`, never following symlinks.
+    static func unlock(_ path: String) {
+        var st = stat()
+        guard lstat(path, &st) == 0 else { return }
+        _ = lchflags(path, 0)
+        if (st.st_mode & S_IFMT) == S_IFDIR {
+            _ = chmod(path, 0o700)
+            for e in (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? [] {
+                unlock(path + "/" + e)
+            }
+        } else if (st.st_mode & S_IFMT) != S_IFLNK {
+            _ = chmod(path, 0o600)
+        }
     }
 
     /// Clone `seed`'s contents into `data` (copy-on-write; symlinks copied as links, never
@@ -166,6 +199,7 @@ public enum Container {
     /// Replace `dest` with a copy of `data`'s contents.
     public static func capture(_ data: URL, to dest: URL) {
         let fm = FileManager.default
+        unlock(dest.path)
         try? fm.removeItem(at: dest)
         try? fm.createDirectory(at: dest, withIntermediateDirectories: true,
                                 attributes: [.posixPermissions: 0o700])

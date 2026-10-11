@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "blastbox engine for William Tells QR Killer: Apple Vision barcode decoding, one sandboxed process per image"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-dependencies = ["blastbox>=0.1.45"]
+# [host]: the ingress extension (FastAPI, blastbox.host) and `blastbox serve`/`dispatch`.
+dependencies = ["blastbox[host]>=0.1.45"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5"]

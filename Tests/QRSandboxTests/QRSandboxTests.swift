@@ -139,3 +139,41 @@ struct SandboxedScannerTests {
         #expect((try? SlotProvisioner.verify(again)) != nil)
     }
 }
+
+// MARK: - container hygiene + stray processes
+
+@Suite struct HygieneTests {
+    @Test func wipeUnlocksWhatAScannerCouldLock() throws {
+        let fm = FileManager.default
+        let data = fm.temporaryDirectory.appendingPathComponent("wtqrk-wipe-\(UUID().uuidString)")
+        defer { Container.unlock(data.path); try? fm.removeItem(at: data) }
+        let locked = data.appendingPathComponent("Library/locked")
+        try fm.createDirectory(at: locked, withIntermediateDirectories: true)
+        let f = locked.appendingPathComponent("immutable")
+        try Data("x".utf8).write(to: f)
+        #expect(chflags(f.path, UInt32(UF_IMMUTABLE)) == 0)   // what a scanner can do to its own files
+        #expect(chmod(locked.path, 0o000) == 0)
+        try fm.createSymbolicLink(atPath: data.appendingPathComponent("link").path,
+                                  withDestinationPath: "/etc/hosts")
+        try Container.wipe(data)
+        #expect(try fm.contentsOfDirectory(atPath: data.path).isEmpty)
+        #expect(fm.fileExists(atPath: "/etc/hosts"))           // the link was removed, not followed
+    }
+
+    @Test func aMissingContainerIsClean() throws {
+        try Container.wipe(URL(fileURLWithPath: "/nonexistent/wtqrk-\(UUID().uuidString)"))
+    }
+
+    @Test func sweepKillsStraysRunningTheSlotBinary() throws {
+        let exe = FileManager.default.temporaryDirectory.appendingPathComponent("wtqrk-stray-\(UUID().uuidString)")
+        try FileManager.default.copyItem(atPath: "/bin/sleep", toPath: exe.path)
+        defer { try? FileManager.default.removeItem(at: exe) }
+        let p = Process()
+        p.executableURL = exe
+        p.arguments = ["60"]
+        try p.run()
+        Runner.sweep(executable: exe.path)
+        p.waitUntilExit()
+        #expect(p.terminationReason == .uncaughtSignal && p.terminationStatus == SIGKILL)
+    }
+}

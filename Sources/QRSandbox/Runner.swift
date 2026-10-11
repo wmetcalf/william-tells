@@ -79,20 +79,76 @@ public enum Runner {
             if killed == nil {
                 if Date() >= deadline {
                     killed = "timeout"
-                } else if footprint(pid) > limits.maxFootprintBytes {
+                } else if footprint(of: family(pid)) > limits.maxFootprintBytes {
+                    // The cap is for the whole job: a compromised scanner that forks can't spread
+                    // its allocation across children to stay under it.
                     killed = "memory"
                 }
-                if killed != nil { kill(-pid, SIGKILL); kill(pid, SIGKILL) }
+                if killed != nil { killAll(family(pid)); kill(-pid, SIGKILL) }
             }
             usleep(5_000)
         }
-        // Anything left in the group (the scanner forks nothing, but be sure) goes too.
+        // Anything the scanner left behind (it forks nothing, but a compromised one might) goes too.
+        killAll(family(pid))
         kill(-pid, SIGKILL)
         let stdout = out.finish(), stderr = err.finish()
         let exited = (status & 0x7f) == 0
         return RunResult(exitCode: exited ? (status >> 8) & 0xff : -1, killed: killed,
                          stdout: stdout.data, stdoutTruncated: stdout.truncated, stderr: stderr.data,
                          elapsedMs: Int(Date().timeIntervalSince(t0) * 1000))
+    }
+
+    /// `root`, its process group, and every descendant still parented under any of them.
+    static func family(_ root: pid_t) -> Set<pid_t> {
+        var out: Set<pid_t> = [root]
+        out.formUnion(listPids(type: UInt32(PROC_PGRP_ONLY), arg: UInt32(root)))
+        var frontier = Array(out)
+        while let p = frontier.popLast() {
+            for c in childPids(p) where !out.contains(c) {
+                out.insert(c)
+                frontier.append(c)
+            }
+        }
+        return out
+    }
+
+    static func footprint(of pids: Set<pid_t>) -> UInt64 {
+        pids.reduce(0) { $0 &+ footprint($1) }
+    }
+
+    static func killAll(_ pids: Set<pid_t>) {
+        for p in pids where p > 1 { kill(p, SIGKILL) }
+    }
+
+    /// Kill every process whose executable is `executable` (a slot's scanner), and wait for them
+    /// to go. Run before a slot is wiped or reused: a forked scanner that escaped its process
+    /// group (setsid, then orphaned) still runs the slot's binary, so it is found by path.
+    public static func sweep(executable: String) {
+        for _ in 0..<200 {
+            let stray = listPids(type: UInt32(PROC_ALL_PIDS), arg: 0).filter { pidPath($0) == executable }
+            if stray.isEmpty { return }
+            killAll(Set(stray))
+            usleep(5_000)
+        }
+    }
+
+    static func listPids(type: UInt32, arg: UInt32) -> [pid_t] {
+        let n = proc_listpids(type, arg, nil, 0)
+        guard n > 0 else { return [] }
+        var buf = [pid_t](repeating: 0, count: Int(n) / MemoryLayout<pid_t>.size + 64)
+        let got = buf.withUnsafeMutableBytes { proc_listpids(type, arg, $0.baseAddress, Int32($0.count)) }
+        return Array(buf.prefix(max(0, Int(got)) / MemoryLayout<pid_t>.size)).filter { $0 > 0 }
+    }
+
+    static func childPids(_ pid: pid_t) -> [pid_t] {
+        var buf = [pid_t](repeating: 0, count: 256)
+        let got = buf.withUnsafeMutableBytes { proc_listchildpids(pid, $0.baseAddress, Int32($0.count)) }
+        return Array(buf.prefix(max(0, Int(got)))).filter { $0 > 0 }
+    }
+
+    static func pidPath(_ pid: pid_t) -> String? {
+        var buf = [CChar](repeating: 0, count: 4096)
+        return proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 ? String(cString: buf) : nil
     }
 
     static func footprint(_ pid: pid_t) -> UInt64 {
