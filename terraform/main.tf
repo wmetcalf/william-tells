@@ -297,7 +297,7 @@ resource "terraform_data" "provision" {
       "xcode-select -p || (xcode-select --install && sleep 120) || true",
       "mkdir -p /Users/ec2-user/qr-scanner/Tests/AppTests",
       "cd /Users/ec2-user/qr-scanner && swift build -c release 2>&1",
-      "sudo mkdir -p /var/log/wtqrk && sudo chown ec2-user /var/log/wtqrk",
+      "sudo mkdir -p /var/log/wtqrk && sudo chown -R ec2-user /var/log/wtqrk",  # -R: the old root daemon left root-owned logs here
       # Earlier deploys ran the app as a root LaunchDaemon, where App Sandbox can't start the scanner.
       "sudo launchctl bootout system/com.wtqrk.qrscanner 2>/dev/null || true",
       "sudo rm -f /Library/LaunchDaemons/com.wtqrk.qrscanner.plist",
