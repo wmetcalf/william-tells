@@ -264,6 +264,12 @@ resource "terraform_data" "provision" {
     destination = "/Users/ec2-user/qr-scanner/Sources"
   }
 
+  # Package.swift declares the test targets' paths; SwiftPM rejects the manifest if they're missing.
+  provisioner "file" {
+    source      = "${path.module}/../Tests"
+    destination = "/Users/ec2-user/qr-scanner/Tests"
+  }
+
   provisioner "file" {
     source      = "${path.module}/../Package.swift"
     destination = "/Users/ec2-user/qr-scanner/Package.swift"
@@ -295,7 +301,6 @@ resource "terraform_data" "provision" {
     inline = [
       "sleep 30",
       "xcode-select -p || (xcode-select --install && sleep 120) || true",
-      "mkdir -p /Users/ec2-user/qr-scanner/Tests/AppTests",
       "cd /Users/ec2-user/qr-scanner && swift build -c release 2>&1",
       "sudo mkdir -p /var/log/wtqrk && sudo chown -R ec2-user /var/log/wtqrk",  # -R: the old root daemon left root-owned logs here
       # Earlier deploys ran the app as a root LaunchDaemon, where App Sandbox can't start the scanner.

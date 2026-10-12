@@ -131,7 +131,10 @@ private func pngBomb(width: UInt32, height: UInt32) -> Data? {
     @Test func realSVGDocumentsAreSVG() {
         for doc in ["<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
                     "\u{FEFF}  <?xml version=\"1.0\"?>\n<!-- hi -->\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\">\n<svg width=\"1\">",
-                    "\n\t<svg>"] {
+                    "\n\t<svg>",
+                    // an internal subset: its declarations have their own '>'
+                    "<!DOCTYPE svg [<!ENTITY x \"v>\"><!ELEMENT svg ANY>]><svg>",
+                    "<!DOCTYPE svg PUBLIC \"a>b\" 'c>d'>\n<svg/>"] {
             #expect(QRScannerEngine.isSVG(Data(doc.utf8)), "\(doc)")
         }
     }
@@ -144,5 +147,13 @@ private func pngBomb(width: UInt32, height: UInt32) -> Data? {
         let xml = Data("<?xml version=\"1.0\"?><html><svg/></html>".utf8)
         let svgish = Data("<svgfoo/>".utf8)
         for d in [png, psd, xml, svgish] { #expect(!QRScannerEngine.isSVG(d)) }
+    }
+
+    @Test func shortMalformedUTF8IsNotSVGAndDoesNotTrap() {
+        // fewer than three bytes that aren't UTF-8: the "cut mid-char" retry must not go negative
+        for d in [Data([0xFF]), Data([0xFF, 0xFE]), Data([0xC3]), Data()] {
+            #expect(!QRScannerEngine.isSVG(d))
+        }
+        #expect(!QRScannerEngine.isSVG(Data("<!DOCTYPE svg [<!ENTITY x \"v\">".utf8)))  // unterminated
     }
 }

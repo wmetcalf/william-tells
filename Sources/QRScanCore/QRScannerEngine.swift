@@ -313,7 +313,7 @@ public actor QRScannerEngine {
         var bytes = data.prefix(4096)
         if bytes.starts(with: [0xEF, 0xBB, 0xBF]) { bytes = bytes.dropFirst(3) }
         guard let text = String(data: Data(bytes), encoding: .utf8)
-                ?? String(data: Data(bytes.prefix(bytes.count - 3)), encoding: .utf8)   // cut mid-char
+                ?? String(data: Data(bytes.prefix(max(0, bytes.count - 3))), encoding: .utf8)   // cut mid-char
         else { return false }
         var rest = Substring(text)
         while true {
@@ -325,8 +325,8 @@ public actor QRScannerEngine {
                 guard let end = rest.range(of: "-->") else { return false }
                 rest = rest[end.upperBound...]
             } else if rest.prefix(9).lowercased() == "<!doctype" {
-                guard let end = rest.firstIndex(of: ">") else { return false }
-                rest = rest[rest.index(after: end)...]
+                guard let end = doctypeEnd(rest) else { return false }
+                rest = rest[end...]
             } else {
                 break
             }
@@ -334,6 +334,30 @@ public actor QRScannerEngine {
         guard rest.hasPrefix("<svg") else { return false }
         let next = rest.dropFirst(4).first
         return next == nil || next == ">" || next == "/" || next!.isWhitespace
+    }
+
+    /// Just past a DOCTYPE's closing `>`, skipping an internal subset (`[ ... ]`, whose entity
+    /// and element declarations have their own `>`) and quoted literals.
+    private static func doctypeEnd(_ s: Substring) -> Substring.Index? {
+        var quote: Character? = nil
+        var depth = 0
+        var i = s.startIndex
+        while i < s.endIndex {
+            let c = s[i]
+            if let q = quote {
+                if c == q { quote = nil }
+            } else if c == "\"" || c == "'" {
+                quote = c
+            } else if c == "[" {
+                depth += 1
+            } else if c == "]" {
+                depth = max(0, depth - 1)
+            } else if c == ">" && depth == 0 {
+                return s.index(after: i)
+            }
+            i = s.index(after: i)
+        }
+        return nil
     }
 
     private static func isPDF(_ data: Data) -> Bool {
