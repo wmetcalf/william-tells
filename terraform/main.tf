@@ -259,6 +259,16 @@ resource "terraform_data" "provision" {
     timeout     = "15m"
   }
 
+  # The file provisioner copies over what's there and never deletes: clear the uploaded trees
+  # first, so a file removed from the repo can't stay on the instance and get compiled. (.build
+  # is kept for incremental builds.)
+  provisioner "remote-exec" {
+    inline = [
+      "mkdir -p /Users/ec2-user/qr-scanner",
+      "rm -rf /Users/ec2-user/qr-scanner/Sources /Users/ec2-user/qr-scanner/Tests /Users/ec2-user/qr-scanner/Package.swift",
+    ]
+  }
+
   provisioner "file" {
     source      = "${path.module}/../Sources"
     destination = "/Users/ec2-user/qr-scanner/Sources"

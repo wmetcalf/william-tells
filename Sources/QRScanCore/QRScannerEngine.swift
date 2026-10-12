@@ -308,54 +308,75 @@ public actor QRScannerEngine {
     /// SVG only if the document's first element is `<svg`: after an optional BOM, whitespace,
     /// an XML declaration / processing instructions, comments and a DOCTYPE -- nothing else.
     /// (A substring test would send a PNG or PSD with "<svg" in a text chunk to NSImage, which
-    /// auto-detects the real format and skips the raster allowlist and pixel limit.)
+    /// auto-detects the real format and skips the raster allowlist and pixel limit.) Scans raw
+    /// bytes over the whole input, so a long prolog still finds the root and no UTF-8 decoding
+    /// (or a copy of a large image) is needed; a binary format fails on its first byte.
     static func isSVG(_ data: Data) -> Bool {
-        var bytes = data.prefix(4096)
-        if bytes.starts(with: [0xEF, 0xBB, 0xBF]) { bytes = bytes.dropFirst(3) }
-        guard let text = String(data: Data(bytes), encoding: .utf8)
-                ?? String(data: Data(bytes.prefix(max(0, bytes.count - 3))), encoding: .utf8)   // cut mid-char
-        else { return false }
-        var rest = Substring(text)
-        while true {
-            rest = rest.drop(while: { $0.isWhitespace })
-            if rest.hasPrefix("<?") {
-                guard let end = rest.range(of: "?>") else { return false }
-                rest = rest[end.upperBound...]
-            } else if rest.hasPrefix("<!--") {
-                guard let end = rest.range(of: "-->") else { return false }
-                rest = rest[end.upperBound...]
-            } else if rest.prefix(9).lowercased() == "<!doctype" {
-                guard let end = doctypeEnd(rest) else { return false }
-                rest = rest[end...]
-            } else {
-                break
+        data.withUnsafeBytes { raw -> Bool in
+            let b = raw.bindMemory(to: UInt8.self)
+            var i = 0
+            if b.count >= 3, b[0] == 0xEF, b[1] == 0xBB, b[2] == 0xBF { i = 3 }
+            func at(_ s: String) -> Bool {
+                let u = Array(s.utf8)
+                guard i + u.count <= b.count else { return false }
+                for k in 0..<u.count where b[i + k] != u[k] { return false }
+                return true
             }
+            func atDoctype() -> Bool {
+                let u = Array("<!doctype".utf8)
+                guard i + u.count <= b.count else { return false }
+                for k in 0..<u.count where b[i + k] | (k >= 2 ? 0x20 : 0) != u[k] { return false }
+                return true
+            }
+            func skip(past end: String) -> Bool {   // moves i just past `end`
+                let u = Array(end.utf8)
+                while i + u.count <= b.count {
+                    if at(end) { i += u.count; return true }
+                    i += 1
+                }
+                return false
+            }
+            while true {
+                while i < b.count, [0x20, 0x09, 0x0A, 0x0D].contains(b[i]) { i += 1 }
+                if at("<?") {
+                    guard skip(past: "?>") else { return false }
+                } else if at("<!--") {
+                    guard skip(past: "-->") else { return false }
+                } else if atDoctype() {
+                    guard let end = doctypeEnd(b, from: i) else { return false }
+                    i = end
+                } else {
+                    break
+                }
+            }
+            guard at("<svg") else { return false }
+            guard i + 4 < b.count else { return true }
+            let next = b[i + 4]
+            return next == UInt8(ascii: ">") || next == UInt8(ascii: "/")
+                || [0x20, 0x09, 0x0A, 0x0D].contains(next)
         }
-        guard rest.hasPrefix("<svg") else { return false }
-        let next = rest.dropFirst(4).first
-        return next == nil || next == ">" || next == "/" || next!.isWhitespace
     }
 
     /// Just past a DOCTYPE's closing `>`, skipping an internal subset (`[ ... ]`, whose entity
     /// and element declarations have their own `>`) and quoted literals.
-    private static func doctypeEnd(_ s: Substring) -> Substring.Index? {
-        var quote: Character? = nil
+    private static func doctypeEnd(_ b: UnsafeBufferPointer<UInt8>, from start: Int) -> Int? {
+        var quote: UInt8? = nil
         var depth = 0
-        var i = s.startIndex
-        while i < s.endIndex {
-            let c = s[i]
+        var i = start
+        while i < b.count {
+            let c = b[i]
             if let q = quote {
                 if c == q { quote = nil }
-            } else if c == "\"" || c == "'" {
+            } else if c == UInt8(ascii: "\"") || c == UInt8(ascii: "'") {
                 quote = c
-            } else if c == "[" {
+            } else if c == UInt8(ascii: "[") {
                 depth += 1
-            } else if c == "]" {
+            } else if c == UInt8(ascii: "]") {
                 depth = max(0, depth - 1)
-            } else if c == ">" && depth == 0 {
-                return s.index(after: i)
+            } else if c == UInt8(ascii: ">") && depth == 0 {
+                return i + 1
             }
-            i = s.index(after: i)
+            i += 1
         }
         return nil
     }

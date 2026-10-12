@@ -156,4 +156,15 @@ private func pngBomb(width: UInt32, height: UInt32) -> Data? {
         }
         #expect(!QRScannerEngine.isSVG(Data("<!DOCTYPE svg [<!ENTITY x \"v\">".utf8)))  // unterminated
     }
+
+    @Test func aLongPrologStillFindsTheRoot() {
+        // the root can sit well past the first 4 KiB: a long comment, then a long DOCTYPE subset
+        let comment = "<!-- " + String(repeating: "x", count: 10_000) + " -->"
+        let entities = (0..<300).map { "<!ENTITY e\($0) \"\($0)\">" }.joined()
+        let doc = "<?xml version=\"1.0\"?>\(comment)<!DOCTYPE svg [\(entities)]>\n<svg width=\"1\"/>"
+        #expect(Data(doc.utf8).count > 3 * 4096)
+        #expect(QRScannerEngine.isSVG(Data(doc.utf8)))
+        // non-ASCII inside a comment is fine; the scan never decodes UTF-8
+        #expect(QRScannerEngine.isSVG(Data("<!-- café ☕ --><svg/>".utf8)))
+    }
 }
