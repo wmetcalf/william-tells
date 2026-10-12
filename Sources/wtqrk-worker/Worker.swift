@@ -20,6 +20,7 @@
 //   BLASTBOX_WORKER_AGENT_TOKEN         bearer token (Authorization: Bearer / X-aws-proxy-auth)
 //   BLASTBOX_WORKER_AGENT_ALLOW_CIDRS   peer allowlist, comma-separated
 //   BLASTBOX_WORKER_AGENT_MAX_BYTES     request body cap (default 100 MiB)
+//   BLASTBOX_WORKER_AGENT_UPLOAD_TIMEOUT  seconds to receive the whole body (default 120)
 //   BLASTBOX_WORKER_AGENT_ALLOW_INSECURE=1  serve a non-loopback bind with no token/allowlist
 // Per job (X-Blastbox-Params, already allowlisted by the dispatcher): WTQRK_MODE, WTQRK_CONFIG,
 // BLASTBOX_TIMEOUT, BLASTBOX_MAX_INPUT, BLASTBOX_MEM, BLASTBOX_MAX_METADATA.
@@ -53,6 +54,7 @@ enum WTQRKWorker {
         let port = Int(e["BLASTBOX_WORKER_AGENT_PORT"] ?? "") ?? 8765
         let token = e["BLASTBOX_WORKER_AGENT_TOKEN"].flatMap { $0.isEmpty ? nil : $0 }
         let maxBytes = Int(e["BLASTBOX_WORKER_AGENT_MAX_BYTES"] ?? "") ?? 100 << 20
+        let uploadTimeout = Int64(e["BLASTBOX_WORKER_AGENT_UPLOAD_TIMEOUT"] ?? "").flatMap { $0 > 0 ? $0 : nil } ?? 120
         let cidrs = try parseCIDRs(e["BLASTBOX_WORKER_AGENT_ALLOW_CIDRS"] ?? "")
 
         for key in ["BLASTBOX_WORKER_AGENT_TLS_CERT", "BLASTBOX_WORKER_AGENT_TLS_KEY",
@@ -61,9 +63,11 @@ enum WTQRKWorker {
                 + "http_agent for TLS/mTLS, or put a TLS proxy in front and bind loopback")
         }
         let loopback = ["127.0.0.1", "localhost", "::1"].contains(bind)
-        if !loopback && token == nil && cidrs.isEmpty && e["BLASTBOX_WORKER_AGENT_ALLOW_INSECURE"] != "1" {
-            throw WorkerError("refusing to serve \(bind):\(port) with no token and no "
-                + "BLASTBOX_WORKER_AGENT_ALLOW_CIDRS: anyone who reaches the port could submit jobs")
+        // A /0 network admits every address, so it gates nothing.
+        let gated = token != nil || (!cidrs.isEmpty && !cidrs.contains { $0.bits == 0 })
+        if !loopback && !gated && e["BLASTBOX_WORKER_AGENT_ALLOW_INSECURE"] != "1" {
+            throw WorkerError("refusing to serve \(bind):\(port) with no token and no narrower "
+                + "BLASTBOX_WORKER_AGENT_ALLOW_CIDRS than /0: anyone who reaches the port could submit jobs")
         }
 
         let scannerPath = e["WTQRK_SCAN_BIN"].flatMap { $0.isEmpty ? nil : $0 }
@@ -83,8 +87,8 @@ enum WTQRKWorker {
         app.http.server.configuration.hostname = bind
         app.http.server.configuration.port = port
         app.routes.defaultMaxBodySize = ByteCount(value: maxBytes)
-        let agent = Agent(scanner: scanner, token: token, cidrs: cidrs, maxBytes: maxBytes, gate: gate,
-                          logger: app.logger)
+        let agent = Agent(scanner: scanner, token: token, cidrs: cidrs, maxBytes: maxBytes,
+                          uploadTimeout: .seconds(uploadTimeout), gate: gate, logger: app.logger)
 
         app.get("healthz") { req async -> Response in
             if let denied = agent.deny(req) { return denied }
@@ -119,16 +123,18 @@ final class Agent: Sendable {
     let token: String?
     let cidrs: [CIDR]
     let maxBytes: Int
+    let uploadTimeout: TimeAmount
     let gate: (ok: Bool, detail: String)
     let logger: Logger
     private let busy = Busy()
 
     init(scanner: SandboxedScanner, token: String?, cidrs: [CIDR], maxBytes: Int,
-         gate: (ok: Bool, detail: String), logger: Logger) {
+         uploadTimeout: TimeAmount, gate: (ok: Bool, detail: String), logger: Logger) {
         self.scanner = scanner
         self.token = token
         self.cidrs = cidrs
         self.maxBytes = maxBytes
+        self.uploadTimeout = uploadTimeout
         self.gate = gate
         self.logger = logger
     }
@@ -163,7 +169,11 @@ final class Agent: Sendable {
         }
         let body: Data
         do {
-            body = try await req.body.collect(max: maxBytes).get().map { Data(buffer: $0) } ?? Data()
+            body = try await receive(req)
+        } catch is UploadTimedOut {
+            let r = Agent.json(.requestTimeout, ["error": "upload_timeout"])
+            r.headers.replaceOrAdd(name: .connection, value: "close")
+            return r
         } catch {
             return Agent.json(.payloadTooLarge, ["error": "too_large"])
         }
@@ -238,6 +248,54 @@ func constantTimeEqual(_ a: [UInt8], _ b: [UInt8]) -> Bool {
         diff |= (i < a.count ? a[i] : 0) ^ (i < b.count ? b[i] : 0)
     }
     return diff == 0
+}
+
+struct UploadTimedOut: Error {}
+
+extension Agent {
+    /// The request body, capped at maxBytes and at uploadTimeout of wall clock: a client trickling
+    /// bytes can't hold the single-flight busy flag forever. After the deadline whatever still
+    /// arrives is dropped, not buffered.
+    func receive(_ req: Request) async throws -> Data {
+        let loop = req.eventLoop
+        let promise = loop.makePromise(of: Data.self)
+        let state = UploadState()
+        let timer = loop.scheduleTask(in: uploadTimeout) {
+            if state.finish() { promise.fail(UploadTimedOut()) }
+        }
+        let max = maxBytes
+        req.body.drain { part in
+            switch part {
+            case .buffer(var chunk):
+                if !state.append(&chunk, max: max) {
+                    if state.finish() { timer.cancel(); promise.fail(Abort(.payloadTooLarge)) }
+                }
+            case .error(let error):
+                if state.finish() { timer.cancel(); promise.fail(error) }
+            case .end:
+                if state.finish() { timer.cancel(); promise.succeed(state.data) }
+            }
+            return loop.makeSucceededVoidFuture()
+        }
+        return try await promise.futureResult.get()
+    }
+}
+
+final class UploadState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    private(set) var data = Data()
+    /// False once over max; a no-op after finish().
+    func append(_ chunk: inout ByteBuffer, max: Int) -> Bool {
+        lock.withLock {
+            if done { return true }
+            if data.count + chunk.readableBytes > max { return false }
+            data.append(contentsOf: chunk.readableBytesView)
+            return true
+        }
+    }
+    /// True for exactly one caller.
+    func finish() -> Bool { lock.withLock { if done { return false }; done = true; return true } }
 }
 
 final class Busy: @unchecked Sendable {

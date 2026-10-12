@@ -43,14 +43,14 @@ def _free_port() -> int:
 
 
 class Agent:
-    def __init__(self, tmp: Path, slot: int, scanner: Path = SCANNER):
+    def __init__(self, tmp: Path, slot: int, scanner: Path = SCANNER, env: dict | None = None):
         self.port = _free_port()
         self.log = tmp / f"agent-{slot}.log"
         env = {"HOME": os.environ["HOME"], "PATH": "/usr/bin:/bin",
                "WTQRK_SCAN_BIN": str(scanner), "WTQRK_WORKER_SLOT": str(slot),
                "WTQRK_SLOT_ROOT": str(tmp / "slots"),
                "BLASTBOX_WORKER_AGENT_TOKEN": TOKEN,
-               "BLASTBOX_WORKER_AGENT_PORT": str(self.port)}
+               "BLASTBOX_WORKER_AGENT_PORT": str(self.port), **(env or {})}
         self.proc = subprocess.Popen([str(WORKER)], env=env, stdout=self.log.open("wb"),
                                      stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 60
@@ -220,3 +220,34 @@ def test_rejected_uploads_are_not_buffered(agent):
         status = s.recv(4096).split(b"\r\n", 1)[0]
     assert status.split()[1] == b"401", status
     assert peak - before < 32 << 10, f"worker grew {peak - before} KB on a rejected upload"
+
+
+def test_a_catch_all_allowlist_is_not_a_gate(tmp_path):
+    # 0.0.0.0/0 admits everyone: with no token, a non-loopback bind is refused at startup.
+    for cidrs in ("0.0.0.0/0", "10.0.0.0/8,::/0"):
+        env = {"HOME": os.environ["HOME"], "PATH": "/usr/bin:/bin",
+               "WTQRK_SLOT_ROOT": str(tmp_path / "slots"), "WTQRK_WORKER_SLOT": "953",
+               "BLASTBOX_WORKER_AGENT_BIND": "0.0.0.0", "BLASTBOX_WORKER_AGENT_PORT": str(_free_port()),
+               "BLASTBOX_WORKER_AGENT_ALLOW_CIDRS": cidrs}
+        r = subprocess.run([str(WORKER)], env=env, capture_output=True, timeout=60)
+        assert r.returncode == 78, r
+        assert b"refusing to serve" in r.stdout + r.stderr
+
+
+def test_a_trickled_upload_cannot_hold_the_worker(tmp_path):
+    # An authenticated client that sends a few bytes and stalls loses the single-flight slot
+    # at the upload deadline, so the next real job runs instead of getting 409 forever.
+    a = Agent(tmp_path, 954, env={"BLASTBOX_WORKER_AGENT_UPLOAD_TIMEOUT": "2"})
+    try:
+        with socket.create_connection(("127.0.0.1", a.port), timeout=30) as s:
+            s.sendall((f"POST /detonate?name=in.png HTTP/1.1\r\nHost: x\r\nX-aws-proxy-auth: {TOKEN}\r\n"
+                       "Content-Length: 1000000\r\n\r\n").encode() + b"\x89PNG")
+            time.sleep(0.5)
+            with pytest.raises(urllib.error.HTTPError) as busy:
+                a.detonate(_qr("blocked", tmp_path))
+            assert busy.value.code == 409
+            time.sleep(2.5)
+            tar_bytes = a.detonate(_qr("https://after-trickle.example/", tmp_path))
+            assert b"after-trickle.example" in tar_bytes
+    finally:
+        a.stop()
