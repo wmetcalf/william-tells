@@ -247,6 +247,23 @@ struct SandboxedScannerTests {
     }
 }
 
+@Suite struct ScannerOutcomeTests {
+    @Test func okOutputFromAFailedExitIsAnEngineError() throws {
+        let doc = #"{"schema":"wtqrk.scan/1","ok":true,"mode":"default","compute":"auto","report":{"imageDimensions":{"width":1,"height":1},"mutationsTried":0,"detections":[]}}"#
+        for rc: Int32 in [1, 139, -1] {
+            let r = RunResult(exitCode: rc, killed: nil, stdout: Data(doc.utf8), stdoutTruncated: false,
+                              stderr: Data("boom".utf8), elapsedMs: 1)
+            guard case .engineError(let code, _) = SandboxedScanner.outcome(r) else {
+                Issue.record("rc=\(rc) accepted"); continue
+            }
+            #expect(code == "scanner_failed")
+        }
+        let ok = RunResult(exitCode: 0, killed: nil, stdout: Data(doc.utf8), stdoutTruncated: false,
+                           stderr: Data(), elapsedMs: 1)
+        if case .ok = SandboxedScanner.outcome(ok) {} else { Issue.record("rc=0 rejected: \(SandboxedScanner.outcome(ok))") }
+    }
+}
+
 enum StaticScannerOutcome {
     static func isEngineError(_ r: RunResult) -> Bool {
         if case .engineError(let code, _) = SandboxedScanner.outcome(r) { return code == "scanner_killed" }

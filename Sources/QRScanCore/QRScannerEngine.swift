@@ -312,6 +312,32 @@ public actor QRScannerEngine {
     /// bytes over the whole input, so a long prolog still finds the root and no UTF-8 decoding
     /// (or a copy of a large image) is needed; a binary format fails on its first byte.
     static func isSVG(_ data: Data) -> Bool {
+        // XML may also be UTF-16 (BOM, or `<` interleaved with NUL); transcode and scan that.
+        if let utf8 = utf16AsUTF8(data) { return svgRoot(utf8) }
+        return svgRoot(data)
+    }
+
+    /// UTF-16 XML (per the XML spec's encoding detection: a BOM, or `<?`/`<` with NUL bytes)
+    /// as UTF-8, or nil when the input isn't UTF-16. Malformed UTF-16 is not SVG.
+    static func utf16AsUTF8(_ data: Data) -> Data? {
+        guard data.count >= 2 else { return nil }
+        let b0 = data[data.startIndex], b1 = data[data.startIndex + 1]
+        let enc: String.Encoding
+        var body = data
+        switch (b0, b1) {
+        case (0xFF, 0xFE): enc = .utf16LittleEndian; body = data.dropFirst(2)
+        case (0xFE, 0xFF): enc = .utf16BigEndian; body = data.dropFirst(2)
+        case (0x3C, 0x00): enc = .utf16LittleEndian
+        case (0x00, 0x3C): enc = .utf16BigEndian
+        default: return nil
+        }
+        guard body.count % 2 == 0, let text = String(data: Data(body), encoding: enc) else {
+            return Data()   // looked like UTF-16 but isn't valid: scanned as empty -> not SVG
+        }
+        return Data(text.utf8)
+    }
+
+    private static func svgRoot(_ data: Data) -> Bool {
         data.withUnsafeBytes { raw -> Bool in
             let b = raw.bindMemory(to: UInt8.self)
             var i = 0
@@ -358,13 +384,39 @@ public actor QRScannerEngine {
     }
 
     /// Just past a DOCTYPE's closing `>`, skipping an internal subset (`[ ... ]`, whose entity
-    /// and element declarations have their own `>`) and quoted literals.
+    /// and element declarations have their own `>`), quoted literals, and comments and
+    /// processing instructions inside the subset (which may contain `]` or `>`).
     private static func doctypeEnd(_ b: UnsafeBufferPointer<UInt8>, from start: Int) -> Int? {
         var quote: UInt8? = nil
         var depth = 0
         var i = start
+        func at(_ s: String, _ j: Int) -> Bool {
+            let u = Array(s.utf8)
+            guard j + u.count <= b.count else { return false }
+            for k in 0..<u.count where b[j + k] != u[k] { return false }
+            return true
+        }
+        func past(_ end: String, from j: Int) -> Int? {
+            var j = j
+            let n = end.utf8.count
+            while j + n <= b.count {
+                if at(end, j) { return j + n }
+                j += 1
+            }
+            return nil
+        }
         while i < b.count {
             let c = b[i]
+            if quote == nil, depth > 0, at("<!--", i) {
+                guard let e = past("-->", from: i + 4) else { return nil }
+                i = e
+                continue
+            }
+            if quote == nil, depth > 0, at("<?", i) {
+                guard let e = past("?>", from: i + 2) else { return nil }
+                i = e
+                continue
+            }
             if let q = quote {
                 if c == q { quote = nil }
             } else if c == UInt8(ascii: "\"") || c == UInt8(ascii: "'") {

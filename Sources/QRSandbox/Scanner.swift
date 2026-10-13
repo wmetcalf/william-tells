@@ -194,6 +194,13 @@ public actor SandboxedScanner {
         do {
             switch try ScanOutputValidator.parse(r.stdout) {
             case .ok(let scan, let warnings):
+                // A scanner that printed success and then crashed or exited nonzero did not finish
+                // cleanly; don't publish its document as a trustworthy result.
+                guard r.exitCode == 0 else {
+                    return .engineError(code: "scanner_failed",
+                                        message: "scanner reported ok but exited rc=\(r.exitCode); stderr: "
+                                            + tail(r.stderr))
+                }
                 return .ok(scan, warnings: warnings, elapsedMs: r.elapsedMs)
             case .failed(let code, let message):
                 return r.exitCode == 2 || r.exitCode == 3

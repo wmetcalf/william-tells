@@ -184,6 +184,12 @@ class TestDetonate:
         res = eng.detonate(_input(tmp_path), tmp_path, Limits())
         assert res.status == "engine_error" and res.warnings[0].code == "scanner_killed"
 
+    @pytest.mark.parametrize("rc", [1, 139, -11])
+    def test_ok_output_from_a_failed_exit_is_an_engine_error(self, tmp_path, rc):
+        eng, _ = _engine(tmp_path, _ok_doc([DET]), rc=rc)
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "engine_error" and res.warnings[0].code == "scanner_failed"
+
     def test_garbage_output_is_an_engine_error(self, tmp_path):
         eng, _ = _engine(tmp_path, b"\x00\xff garbage")
         res = eng.detonate(_input(tmp_path), tmp_path, Limits())

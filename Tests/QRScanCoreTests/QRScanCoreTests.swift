@@ -167,4 +167,27 @@ private func pngBomb(width: UInt32, height: UInt32) -> Data? {
         // non-ASCII inside a comment is fine; the scan never decodes UTF-8
         #expect(QRScannerEngine.isSVG(Data("<!-- café ☕ --><svg/>".utf8)))
     }
+
+    @Test func utf16SVGIsSVG() {
+        let doc = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<svg width=\"1\"/>"
+        for enc in [String.Encoding.utf16LittleEndian, .utf16BigEndian] {
+            let bare = doc.data(using: enc)!
+            #expect(QRScannerEngine.isSVG(bare))                                   // no BOM
+            let bom: [UInt8] = enc == .utf16LittleEndian ? [0xFF, 0xFE] : [0xFE, 0xFF]
+            #expect(QRScannerEngine.isSVG(Data(bom) + bare))                        // with BOM
+        }
+        // UTF-16 whose root isn't svg, and odd-length / unpaired-surrogate UTF-16, are not SVG
+        #expect(!QRScannerEngine.isSVG("<html><svg/></html>".data(using: .utf16LittleEndian)!))
+        #expect(!QRScannerEngine.isSVG(Data([0xFF, 0xFE, 0x3C, 0x00, 0x73])))
+        #expect(!QRScannerEngine.isSVG(Data([0xFF, 0xFE, 0x00, 0xD8, 0x3C, 0x00])))
+    }
+
+    @Test func bracketsInsideDoctypeCommentsAndPIsAreSkipped() {
+        for doc in ["<!DOCTYPE svg [<!-- ] --><!ELEMENT svg ANY>]><svg/>",
+                    "<!DOCTYPE svg [<!-- > ]> --><!ENTITY x \"v\">]>\n<svg/>",
+                    "<!DOCTYPE svg [<?pi ]> ?><!ELEMENT svg ANY>]><svg/>"] {
+            #expect(QRScannerEngine.isSVG(Data(doc.utf8)), "\(doc)")
+        }
+        #expect(!QRScannerEngine.isSVG(Data("<!DOCTYPE svg [<!-- ]><svg/>".utf8)))  // unterminated
+    }
 }

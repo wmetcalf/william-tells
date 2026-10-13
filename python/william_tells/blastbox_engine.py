@@ -311,6 +311,11 @@ class WilliamTellsEngine:
             msg = str(err.get("message", ""))[:2000]
             status = "rejected" if r.exit_code in (2, 3) else "engine_error"
             return error(code, msg, status=status)
+        if r.exit_code != 0:
+            # Printed success, then crashed or exited nonzero: not a cleanly finished scan.
+            return error("scanner_failed",
+                         f"scanner reported ok but exited rc={r.exit_code}; stderr: "
+                         + r.stderr.decode(errors="replace")[-500:])
 
         dets = doc["detections"]
         fields: dict[str, Any] = {
