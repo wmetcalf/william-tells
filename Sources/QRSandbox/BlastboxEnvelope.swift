@@ -31,8 +31,11 @@ public enum BlastboxEnvelope {
         for (magic, label, mime) in table where at(0, magic) { return (label, mime) }
         if at(0, Array("RIFF".utf8)), at(8, Array("WEBP".utf8)) { return ("webp", "image/webp") }
         if at(4, Array("ftyp".utf8)) {
-            for brand in ["heic", "heix", "mif1", "msf1", "heim", "heis"] where at(8, Array(brand.utf8)) {
+            for brand in ["heic", "heix", "heim", "heis"] where at(8, Array(brand.utf8)) {
                 return ("heic", "image/heic")
+            }
+            for brand in ["mif1", "msf1"] where at(8, Array(brand.utf8)) {   // generic HEIF brands
+                return ("heif", "image/heif")
             }
         }
         return ("unknown", "application/octet-stream")

@@ -276,6 +276,12 @@ struct SandboxedScannerTests {
         #expect(detected(env)["confidence"] as? Double == 1.0)
     }
 
+    @Test func theMagicSniffSeparatesHEIFFromHEIC() {
+        func ftyp(_ brand: String) -> Data { Data([0, 0, 0, 0x18]) + Data("ftyp\(brand)".utf8) + Data(count: 12) }
+        for b in ["heic", "heix", "heim", "heis"] { #expect(BlastboxEnvelope.sniff(ftyp(b)) == ("heic", "image/heic")) }
+        for b in ["mif1", "msf1"] { #expect(BlastboxEnvelope.sniff(ftyp(b)) == ("heif", "image/heif")) }
+    }
+
     @Test func otherwiseTheHostSniffsMagicNumbersOnly() {
         var png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]); png.append(Data("<svg>".utf8))
         #expect(BlastboxEnvelope.sniff(png).label == "png")

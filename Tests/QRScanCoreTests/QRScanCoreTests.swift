@@ -185,6 +185,33 @@ private func pngBomb(width: UInt32, height: UInt32) -> Data? {
         for (name, d) in Self.svg { #expect(NSImage(data: d) != nil, "\(name)") }
     }
 
+    /// A HEIC from ImageIO, and the same file re-branded as generic HEIF (`mif1`): ImageIO
+    /// can't write generic HEIF itself but reads this as `public.heif`.
+    static func heicAndHEIF() -> (heic: Data, heif: Data) {
+        let ctx = CGContext(data: nil, width: 16, height: 16, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let out = NSMutableData()
+        let dst = CGImageDestinationCreateWithData(out, "public.heic" as CFString, 1, nil)!
+        CGImageDestinationAddImage(dst, ctx.makeImage()!, nil)
+        _ = CGImageDestinationFinalize(dst)
+        let heic = out as Data
+        var heif = heic
+        let ftypEnd = Int(heif[0]) << 24 | Int(heif[1]) << 16 | Int(heif[2]) << 8 | Int(heif[3])
+        for i in stride(from: 8, to: ftypEnd - 3, by: 4) where heif[i..<i + 4] == Data("heic".utf8) {
+            heif.replaceSubrange(i..<i + 4, with: Data("mif1".utf8))
+        }
+        return (heic, heif)
+    }
+
+    @Test func genericHEIFIsLabelledHEIFNotHEIC() {
+        let (heic, heif) = Self.heicAndHEIF()
+        #expect(QRScannerEngine.inputType(heic) == "heic")
+        #expect(QRScannerEngine.inputType(heif) == "heif")
+        #expect(QRScannerEngine.inputMIMEs["heif"] == "image/heif")
+        #expect(QRScannerEngine.inputMIMEs["heic"] == "image/heic")
+    }
+
     @Test func inputTypeLabelsWhatTheScannerAccepts() {
         for (name, d) in Self.svg { #expect(QRScannerEngine.inputType(d) == "svg", "\(name)") }
         #expect(QRScannerEngine.inputType(Self.notSVG[0].1) == "png")  // "<svg" in a PNG: still a PNG

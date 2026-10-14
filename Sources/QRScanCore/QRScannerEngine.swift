@@ -339,14 +339,14 @@ public actor QRScannerEngine {
     /// label; hosts only check it is one of these.
     public static let inputMIMEs: [String: String] = [
         "png": "image/png", "jpeg": "image/jpeg", "gif": "image/gif", "tiff": "image/tiff",
-        "bmp": "image/bmp", "webp": "image/webp", "heic": "image/heic",
+        "bmp": "image/bmp", "webp": "image/webp", "heic": "image/heic", "heif": "image/heif",
         "pdf": "application/pdf", "svg": "image/svg+xml",
     ]
 
     private static let rasterLabels: [String: String] = [
         UTType.png.identifier: "png", UTType.jpeg.identifier: "jpeg", UTType.gif.identifier: "gif",
         UTType.tiff.identifier: "tiff", UTType.bmp.identifier: "bmp", UTType.webP.identifier: "webp",
-        UTType.heic.identifier: "heic", UTType.heif.identifier: "heic",
+        UTType.heic.identifier: "heic", UTType.heif.identifier: "heif",
     ]
 
     /// The `inputMIMEs` label of an input the scanner would accept, by the same tests

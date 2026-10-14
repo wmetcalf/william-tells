@@ -65,7 +65,7 @@ _CONFIG_KEYS = frozenset({
 # input sandboxed, so a completed scan's `detected` comes from there; this host never parses XML.
 INPUT_MIMES: dict[str, str] = {
     "png": "image/png", "jpeg": "image/jpeg", "gif": "image/gif", "tiff": "image/tiff",
-    "bmp": "image/bmp", "webp": "image/webp", "heic": "image/heic",
+    "bmp": "image/bmp", "webp": "image/webp", "heic": "image/heic", "heif": "image/heif",
     "pdf": "application/pdf", "svg": "image/svg+xml",
 }
 
@@ -92,8 +92,10 @@ def sniff(head: bytes) -> tuple[str, str]:
             return label, mime
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "webp", "image/webp"
-    if head[4:8] == b"ftyp" and head[8:12] in (b"heic", b"heix", b"mif1", b"msf1", b"heim", b"heis"):
+    if head[4:8] == b"ftyp" and head[8:12] in (b"heic", b"heix", b"heim", b"heis"):
         return "heic", "image/heic"
+    if head[4:8] == b"ftyp" and head[8:12] in (b"mif1", b"msf1"):   # generic HEIF brands
+        return "heif", "image/heif"
     return "unknown", "application/octet-stream"
 
 
@@ -201,7 +203,7 @@ class WilliamTellsEngine:
     # Every untrusted parse runs in wtqrk-scan under select_sandbox(); this process only validates
     # its JSON. blastbox's macOS agent requires the declaration (there's no outer boundary there).
     sandboxed_parsing = True
-    formats = frozenset({"png", "jpeg", "heic", "webp", "tiff", "gif", "bmp", "svg", "pdf"})
+    formats = frozenset({"png", "jpeg", "heic", "heif", "webp", "tiff", "gif", "bmp", "svg", "pdf"})
 
     # One self-test verdict per process (the agent is long-lived; a macOS update needs a
     # restart -- and a `blastbox macos doctor` run -- anyway).

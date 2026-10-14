@@ -340,3 +340,16 @@ def test_an_unknown_input_type_is_bad_output(tmp_path, bad):
     eng, _ = _engine(tmp_path, _ok_doc([DET], inputType=bad))
     res = eng.detonate(_input(tmp_path), tmp_path, Limits())
     assert res.status == "engine_error" and res.warnings[0].code == "bad_scanner_output"
+
+
+@pytest.mark.parametrize("brand,label", [(b"heic", "heic"), (b"heix", "heic"), (b"heim", "heic"),
+                                         (b"heis", "heic"), (b"mif1", "heif"), (b"msf1", "heif")])
+def test_the_magic_sniff_separates_heif_from_heic(brand, label):
+    head = b"\0\0\0\x18ftyp" + brand + b"\0" * 12
+    assert sniff(head) == (label, f"image/{label}")
+
+
+def test_a_heif_input_type_is_reported_as_image_heif(tmp_path):
+    eng, _ = _engine(tmp_path, _ok_doc([DET], inputType="heif"))
+    res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+    assert (res.detected.label, res.detected.mime) == ("heif", "image/heif")
