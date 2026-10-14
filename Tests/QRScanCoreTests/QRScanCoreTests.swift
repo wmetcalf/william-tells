@@ -182,6 +182,18 @@ private func pngBomb(width: UInt32, height: UInt32) -> Data? {
         #expect(!QRScannerEngine.isSVG(Data([0xFF, 0xFE, 0x00, 0xD8, 0x3C, 0x00])))
     }
 
+    @Test func utf32SVGIsSVG() {
+        let doc = "<?xml version=\"1.0\" encoding=\"UTF-32\"?>\n<svg width=\"1\"/>"
+        for (enc, bom) in [(String.Encoding.utf32LittleEndian, [UInt8]([0xFF, 0xFE, 0, 0])),
+                           (.utf32BigEndian, [0, 0, 0xFE, 0xFF])] {
+            let bare = doc.data(using: enc)!
+            #expect(QRScannerEngine.isSVG(bare))
+            #expect(QRScannerEngine.isSVG(Data(bom) + bare))
+        }
+        #expect(!QRScannerEngine.isSVG("<html><svg/></html>".data(using: .utf32LittleEndian)!))
+        #expect(!QRScannerEngine.isSVG(Data([0xFF, 0xFE, 0, 0, 0x3C, 0, 0])))   // truncated
+    }
+
     @Test func namespacePrefixedRootsAreSVGOnlyWithTheSVGNamespace() {
         for doc in ["<svg:svg xmlns:svg=\"http://www.w3.org/2000/svg\" width=\"1\"/>",
                     "<?xml version=\"1.0\"?>\n<s:svg\n  version='1.1' xmlns:s = 'http://www.w3.org/2000/svg'>"] {

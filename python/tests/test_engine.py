@@ -328,6 +328,10 @@ _SVG_YES = [
     '<?xml version="1.0" encoding="UTF-16"?>\n<svg width="1"/>'.encode("utf-16-be"),
     b"\xff\xfe" + "<svg/>".encode("utf-16-le"),
     b"\xfe\xff" + "<svg/>".encode("utf-16-be"),
+    "<?xml version=\"1.0\"?><svg/>".encode("utf-32-le"),
+    "<?xml version=\"1.0\"?><svg/>".encode("utf-32-be"),
+    b"\xff\xfe\0\0" + "<svg/>".encode("utf-32-le"),
+    b"\0\0\xfe\xff" + "<svg/>".encode("utf-32-be"),
 ]
 _SVG_NO = [
     b"\x89PNG\r\n\x1a\n\0\0\0\x10tEXtComment\0<svg>",
@@ -341,6 +345,8 @@ _SVG_NO = [
     b"<!DOCTYPE svg [<!-- ]><svg/>",
     b"\xff\xfe<\0s",
     b"\xff\xfe\0\xd8<\0",
+    b"\xff\xfe\0\0<\0\0",                       # truncated UTF-32
+    "<html><svg/></html>".encode("utf-32-le"),
     b"", b"\xff", b"\xc3",
 ]
 

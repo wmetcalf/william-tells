@@ -92,6 +92,12 @@ def sniff(head: bytes) -> tuple[str, str]:
 
 
 _SVG_NS = b"http://www.w3.org/2000/svg"
+_WIDE = (
+    (b"\xff\xfe\0\0", "utf-32-le", 4), (b"\0\0\xfe\xff", "utf-32-be", 4),
+    (b"<\0\0\0", "utf-32-le", 0), (b"\0\0\0<", "utf-32-be", 0),
+    (b"\xff\xfe", "utf-16-le", 2), (b"\xfe\xff", "utf-16-be", 2),
+    (b"<\0", "utf-16-le", 0), (b"\0<", "utf-16-be", 0),
+)
 _WS = b" \t\n\r"
 
 
@@ -99,17 +105,16 @@ def is_svg(data: bytes) -> bool:
     """The scanner's SVG test (QRScannerEngine.isSVG), so `detected` labels every SVG it accepts.
 
     The first element must be ``svg`` (or ``p:svg`` with ``xmlns:p`` bound to the SVG namespace
-    on that tag), after an optional BOM, whitespace, PIs, comments and a DOCTYPE. UTF-16 XML (BOM,
-    or ``<`` interleaved with NUL) is transcoded first; malformed UTF-16 is not SVG.
+    on that tag), after an optional BOM, whitespace, PIs, comments and a DOCTYPE. UTF-32/UTF-16 XML (BOM,
+    or ``<`` padded with NUL) is transcoded first; malformed input is not SVG.
     """
-    enc = {b"\xff\xfe": "utf-16-le", b"\xfe\xff": "utf-16-be",
-           b"<\0": "utf-16-le", b"\0<": "utf-16-be"}.get(data[:2])
-    if enc:
-        body = data[2:] if data[:2] in (b"\xff\xfe", b"\xfe\xff") else data
-        try:
-            data = body.decode(enc).encode()
-        except UnicodeDecodeError:
-            return False
+    for sig, enc, bom in _WIDE:   # 4-byte signatures first: FF FE 00 00 is UTF-32LE
+        if data.startswith(sig):
+            try:
+                data = data[bom:].decode(enc).encode()
+            except UnicodeError:
+                return False
+            break
     i = 3 if data.startswith(b"\xef\xbb\xbf") else 0
     n = len(data)
     while True:

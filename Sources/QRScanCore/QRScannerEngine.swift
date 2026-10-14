@@ -314,26 +314,30 @@ public actor QRScannerEngine {
     /// (or a copy of a large image) is needed; a binary format fails on its first byte.
     public static func isSVG(_ data: Data) -> Bool {
         // XML may also be UTF-16 (BOM, or `<` interleaved with NUL); transcode and scan that.
-        if let utf8 = utf16AsUTF8(data) { return svgRoot(utf8) }
+        if let utf8 = wideAsUTF8(data) { return svgRoot(utf8) }
         return svgRoot(data)
     }
 
-    /// UTF-16 XML (per the XML spec's encoding detection: a BOM, or `<?`/`<` with NUL bytes)
-    /// as UTF-8, or nil when the input isn't UTF-16. Malformed UTF-16 is not SVG.
-    static func utf16AsUTF8(_ data: Data) -> Data? {
-        guard data.count >= 2 else { return nil }
-        let b0 = data[data.startIndex], b1 = data[data.startIndex + 1]
-        let enc: String.Encoding
-        var body = data
-        switch (b0, b1) {
-        case (0xFF, 0xFE): enc = .utf16LittleEndian; body = data.dropFirst(2)
-        case (0xFE, 0xFF): enc = .utf16BigEndian; body = data.dropFirst(2)
-        case (0x3C, 0x00): enc = .utf16LittleEndian
-        case (0x00, 0x3C): enc = .utf16BigEndian
-        default: return nil
-        }
-        guard body.count % 2 == 0, let text = String(data: Data(body), encoding: enc) else {
-            return Data()   // looked like UTF-16 but isn't valid: scanned as empty -> not SVG
+    /// UTF-32 / UTF-16 XML (per the XML spec's encoding detection: a BOM, or `<` padded with
+    /// NUL bytes) as UTF-8, or nil when the input is neither. 4-byte signatures are checked
+    /// first (`FF FE 00 00` is UTF-32LE, not UTF-16LE). Malformed input is not SVG.
+    static func wideAsUTF8(_ data: Data) -> Data? {
+        let h = [UInt8](data.prefix(4))
+        let table: [([UInt8], String.Encoding, Int)] = [
+            ([0xFF, 0xFE, 0x00, 0x00], .utf32LittleEndian, 4),
+            ([0x00, 0x00, 0xFE, 0xFF], .utf32BigEndian, 4),
+            ([0x3C, 0x00, 0x00, 0x00], .utf32LittleEndian, 0),
+            ([0x00, 0x00, 0x00, 0x3C], .utf32BigEndian, 0),
+            ([0xFF, 0xFE], .utf16LittleEndian, 2),
+            ([0xFE, 0xFF], .utf16BigEndian, 2),
+            ([0x3C, 0x00], .utf16LittleEndian, 0),
+            ([0x00, 0x3C], .utf16BigEndian, 0),
+        ]
+        guard let (_, enc, bom) = table.first(where: { h.starts(with: $0.0) }) else { return nil }
+        let unit = enc == .utf32LittleEndian || enc == .utf32BigEndian ? 4 : 2
+        let body = data.dropFirst(bom)
+        guard body.count % unit == 0, let text = String(data: Data(body), encoding: enc) else {
+            return Data()   // looked wide but isn't valid: scanned as empty -> not SVG
         }
         return Data(text.utf8)
     }
