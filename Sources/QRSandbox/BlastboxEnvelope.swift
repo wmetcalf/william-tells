@@ -11,11 +11,10 @@ public enum BlastboxEnvelope {
     public static let engine = "williamtells"
     public static let schema = "wtqrk.scan/1"
 
-    /// File-type sniff for the envelope's `detected` (the scanner enforces the real allowlist).
-    /// Magic numbers come from the first 1 KiB; SVG uses the scanner's own root test over the
-    /// whole input, so every SVG the scanner accepts is labelled as one.
-    public static func sniff(_ input: Data) -> (label: String, mime: String) {
-        let b = [UInt8](input.prefix(1024))
+    /// Magic-number sniff of the first bytes, for when the scanner didn't report `inputType`
+    /// (a failed scan). No XML parsing here: that runs only inside the sandboxed scanner.
+    public static func sniff(_ head: Data) -> (label: String, mime: String) {
+        let b = [UInt8](head.prefix(1024))
         func at(_ off: Int, _ magic: [UInt8]) -> Bool {
             b.count >= off + magic.count && Array(b[off..<off + magic.count]) == magic
         }
@@ -36,7 +35,6 @@ public enum BlastboxEnvelope {
                 return ("heic", "image/heic")
             }
         }
-        if QRScannerEngine.isSVG(input) { return ("svg", "image/svg+xml") }
         return ("unknown", "application/octet-stream")
     }
 
@@ -48,9 +46,13 @@ public enum BlastboxEnvelope {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    /// The sealed envelope for one scan outcome.
-    public static func envelope(outcome: ScanOutcome, inputSHA256: String, input: Data) -> [String: Any] {
-        let (label, mime) = sniff(input)
+    /// The sealed envelope for one scan outcome. `detected` is the type the scanner reported
+    /// for a completed scan (it parsed the input, sandboxed), else the magic-number sniff.
+    public static func envelope(outcome: ScanOutcome, inputSHA256: String, head: Data) -> [String: Any] {
+        var (label, mime) = sniff(head)
+        if case .ok(let scan, _, _) = outcome, let t = scan.inputType, let m = QRScannerEngine.inputMIMEs[t] {
+            (label, mime) = (t, m)
+        }
         let detected: [String: Any] = ["label": label, "mime": mime,
                                        "confidence": label == "unknown" ? 0.0 : 1.0, "source": engine]
         func env(status: String, fields: [String: Any], warnings: [ScanWarning]) -> [String: Any] {

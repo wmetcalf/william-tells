@@ -1,4 +1,5 @@
 import Foundation
+import QRScanCore
 
 /// One detection, validated and flattened (the shape the blastbox envelope carries).
 public struct ValidDetection: Sendable, Equatable, Codable {
@@ -15,6 +16,8 @@ public struct ValidScan: Sendable, Codable {
     public let imageHeight: Int
     public let mutationsTried: Int
     public let detections: [ValidDetection]
+    /// The scanner's `inputType`, already checked against `QRScannerEngine.inputMIMEs`.
+    public var inputType: String? = nil
 }
 
 public struct ScanWarning: Sendable, Equatable, Codable {
@@ -48,6 +51,13 @@ public enum ScanOutputValidator {
             throw OutputError("scanner output is not a JSON object")
         }
         guard doc["schema"] as? String == "wtqrk.scan/1" else { throw OutputError("scanner output has the wrong schema") }
+        var inputType: String? = nil
+        if let t = doc["inputType"], !(t is NSNull) {
+            guard let label = t as? String, QRScannerEngine.inputMIMEs[label] != nil else {
+                throw OutputError("inputType must be one of \(QRScannerEngine.inputMIMEs.keys.sorted())")
+            }
+            inputType = label
+        }
         guard isTrue(doc["ok"]) else {
             let err = doc["error"] as? [String: Any] ?? [:]
             return .failed(code: clip(err["code"] as? String ?? "scan_failed", 64),
@@ -86,7 +96,7 @@ public enum ScanOutputValidator {
                              imageWidth: try int(dims["width"], 1, 1 << 20),
                              imageHeight: try int(dims["height"], 1, 1 << 20),
                              mutationsTried: try int(report["mutationsTried"], 0, 10_000),
-                             detections: dets),
+                             detections: dets, inputType: inputType),
                    warnings: warnings)
     }
 

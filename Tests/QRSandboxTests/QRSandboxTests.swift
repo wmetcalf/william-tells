@@ -26,6 +26,18 @@ import Testing
         #expect(code == "invalid_image" && message == "nope")
     }
 
+    @Test func inputTypeMustBeAnAcceptedLabel() throws {
+        guard case .ok(let scan, _) = try ScanOutputValidator.parse(doc(extra: #","inputType":"svg""#)) else {
+            Issue.record("expected ok"); return
+        }
+        #expect(scan.inputType == "svg")
+        guard case .ok(let none, _) = try ScanOutputValidator.parse(doc()) else { Issue.record("expected ok"); return }
+        #expect(none.inputType == nil)
+        for bad in [#","inputType":"exe""#, #","inputType":7"#, #","inputType":"../svg""#] {
+            #expect(throws: (any Error).self) { try ScanOutputValidator.parse(doc(extra: bad)) }
+        }
+    }
+
     @Test func rejectsMalformedOrHostileOutput() {
         let bad: [Data] = [
             Data("not json".utf8),
@@ -248,24 +260,33 @@ struct SandboxedScannerTests {
 }
 
 @Suite struct EnvelopeSniffTests {
-    @Test func everySVGTheScannerAcceptsIsLabelledSVG() {
-        let ns = "http://www.w3.org/2000/svg"
-        let docs: [Data] = [
-            "<svg:svg xmlns:svg=\"\(ns)\"/>".data(using: .utf8)!,
-            "<?xml version=\"1.0\"?><svg/>".data(using: .utf16LittleEndian)!,
-            Data([0xFE, 0xFF]) + "<svg/>".data(using: .utf16BigEndian)!,
-            ("<!-- " + String(repeating: "x", count: 4000) + " --><svg/>").data(using: .utf8)!,
-        ]
-        for d in docs {
-            #expect(BlastboxEnvelope.sniff(d) == ("svg", "image/svg+xml"))
-            let env = BlastboxEnvelope.envelope(outcome: .rejected(code: "x", message: ""),
-                                                inputSHA256: "", input: d)
-            #expect((env["detected"] as? [String: Any])?["label"] as? String == "svg")
-        }
-        // "<svg" in a PNG text chunk is still a PNG; an XML doc with a non-svg root isn't SVG
+    func scan(_ inputType: String?) -> ValidScan {
+        ValidScan(mode: "default", compute: "auto", imageWidth: 1, imageHeight: 1, mutationsTried: 0,
+                  detections: [], inputType: inputType)
+    }
+    func detected(_ env: [String: Any]) -> [String: Any] { env["detected"] as? [String: Any] ?? [:] }
+
+    @Test func aCompletedScanIsLabelledWithTheScannersInputType() {
+        // an SVG the host's magic sniff can't see (prefixed root, long prolog): the scanner's word
+        let head = Data(("<!-- " + String(repeating: "x", count: 2000)).utf8)
+        let env = BlastboxEnvelope.envelope(outcome: .ok(scan("svg"), warnings: [], elapsedMs: 1),
+                                            inputSHA256: "", head: head)
+        #expect(detected(env)["label"] as? String == "svg")
+        #expect(detected(env)["mime"] as? String == "image/svg+xml")
+        #expect(detected(env)["confidence"] as? Double == 1.0)
+    }
+
+    @Test func otherwiseTheHostSniffsMagicNumbersOnly() {
         var png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]); png.append(Data("<svg>".utf8))
         #expect(BlastboxEnvelope.sniff(png).label == "png")
-        #expect(BlastboxEnvelope.sniff(Data("<html><svg/></html>".utf8)).label == "unknown")
+        // no XML parsing on the host: text is "unknown" unless the scanner said otherwise
+        #expect(BlastboxEnvelope.sniff(Data("<svg/>".utf8)).label == "unknown")
+        let failed = BlastboxEnvelope.envelope(outcome: .rejected(code: "x", message: ""),
+                                               inputSHA256: "", head: png)
+        #expect(detected(failed)["label"] as? String == "png")
+        let noType = BlastboxEnvelope.envelope(outcome: .ok(scan(nil), warnings: [], elapsedMs: 1),
+                                               inputSHA256: "", head: png)
+        #expect(detected(noType)["label"] as? String == "png")
     }
 }
 

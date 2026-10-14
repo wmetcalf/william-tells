@@ -1,3 +1,4 @@
+import AppKit
 import CoreImage
 import Foundation
 import ImageIO
@@ -128,95 +129,67 @@ private func pngBomb(width: UInt32, height: UInt32) -> Data? {
 }
 
 @Suite struct SVGDetectionTests {
-    @Test func realSVGDocumentsAreSVG() {
-        for doc in ["<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
-                    "\u{FEFF}  <?xml version=\"1.0\"?>\n<!-- hi -->\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\">\n<svg width=\"1\">",
-                    "\n\t<svg>",
-                    // an internal subset: its declarations have their own '>'
-                    "<!DOCTYPE svg [<!ENTITY x \"v>\"><!ELEMENT svg ANY>]><svg>",
-                    "<!DOCTYPE svg PUBLIC \"a>b\" 'c>d'>\n<svg/>"] {
-            #expect(QRScannerEngine.isSVG(Data(doc.utf8)), "\(doc)")
-        }
+    static let ns = "http://www.w3.org/2000/svg"
+    static let wh = " width='10' height='10'"
+    static func u(_ s: String) -> Data { Data(s.utf8) }
+
+    /// SVG documents NSImage renders: each must be routed to the SVG path.
+    static let svg: [(String, Data)] = [
+        ("plain", u("<svg xmlns=\"\(ns)\"\(wh)/>")),
+        ("prolog", u("\u{FEFF}<?xml version=\"1.0\"?>\n<!-- hi -->\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\">\n<svg\(wh)/>")),
+        ("whitespace", u("\n\t<svg\(wh)/>")),
+        ("subset", u("<!DOCTYPE svg [<!ENTITY x \"v>\"><!ELEMENT svg ANY>]><svg\(wh)/>")),
+        ("subset comment", u("<!DOCTYPE svg [<!-- ] --><!ELEMENT svg ANY>]><svg\(wh)/>")),
+        ("subset PI", u("<!DOCTYPE svg [<?pi ]> ?><!ELEMENT svg ANY>]><svg\(wh)/>")),
+        ("prefixed", u("<svg:svg xmlns:svg=\"\(ns)\"\(wh)/>")),
+        ("char refs", u("<s:svg xmlns:s=\"http:&#x2F;&#x2F;www.w3.org/2000/svg\"\(wh)/>")),
+        ("entity", u("<!DOCTYPE s:svg [<!ENTITY n \"\(ns)\">]><s:svg xmlns:s=\"&n;\"\(wh)/>")),
+        ("long prolog", u("<!-- " + String(repeating: "x", count: 10_000) + " --><svg\(wh)/>")),
+        ("UTF-16LE BOM", Data([0xFF, 0xFE]) + "<svg\(wh)/>".data(using: .utf16LittleEndian)!),
+        ("UTF-16BE BOM", Data([0xFE, 0xFF]) + "<svg\(wh)/>".data(using: .utf16BigEndian)!),
+        ("UTF-16 decl", "<?xml version='1.0' encoding='UTF-16'?><svg\(wh)/>".data(using: .utf16LittleEndian)!),
+        ("UTF-32BE", "<svg\(wh)/>".data(using: .utf32BigEndian)!),
+    ]
+
+    /// Not SVG: other formats mentioning "<svg", other roots/namespaces, and XML NSImage
+    /// can't read either (so routing it to ImageIO's "unsupported type" loses nothing).
+    static let notSVG: [(String, Data)] = [
+        ("PNG text chunk", Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + u("\0\0\0\u{10}tEXtComment\0<svg>")),
+        ("PSD", u("8BPS\0\u{1}<svg xmlns=\"x\">")),
+        ("html root", u("<?xml version=\"1.0\"?><html><svg\(wh)/></html>")),
+        ("svgfoo", u("<svgfoo/>")),
+        ("unbound prefix", u("<svg:svg\(wh)/>")),
+        ("other namespace", u("<x:svg xmlns:x=\"urn:not-svg\"\(wh)/>")),
+        ("default other namespace", u("<svg xmlns=\"urn:not-svg\"\(wh)/>")),
+        ("wrong prefix", u("<x:svg xmlns:y=\"\(ns)\"\(wh)/>")),
+        ("unterminated subset", u("<!DOCTYPE svg [<!-- ]><svg/>")),
+        ("UTF-16 no BOM", "<svg\(wh)/>".data(using: .utf16LittleEndian)!),
+        ("UTF-32LE", "<svg\(wh)/>".data(using: .utf32LittleEndian)!),
+        ("entity bomb", u("<!DOCTYPE s [<!ENTITY a \"aaaaaaaaaa\">" + (1...9).map { n in
+            "<!ENTITY \(Character(UnicodeScalar(97 + n)!)) \"" + String(repeating: "&\(Character(UnicodeScalar(96 + n)!));", count: 10) + "\">"
+        }.joined() + "]><svg xmlns='\(ns)' a='&j;'/>")),
+        ("external entity", u("<!DOCTYPE svg [<!ENTITY x SYSTEM \"file:///etc/passwd\">]><x>&x;</x>")),
+        ("empty", Data()), ("one byte", Data([0xFF])), ("BOM only", Data([0xFF, 0xFE])),
+    ]
+
+    @Test func svgDocumentsAreSVG() {
+        for (name, d) in Self.svg { #expect(QRScannerEngine.isSVG(d), "\(name)") }
     }
 
-    @Test func otherFormatsMentioningSVGAreNot() {
-        // "<svg" inside a PNG text chunk, a PSD resource, or an XML document whose root isn't svg
-        var png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
-        png.append(Data("\0\0\0\u{10}tEXtComment\0<svg>".utf8))
-        let psd = Data("8BPS\0\u{1}<svg xmlns=\"x\">".utf8)
-        let xml = Data("<?xml version=\"1.0\"?><html><svg/></html>".utf8)
-        let svgish = Data("<svgfoo/>".utf8)
-        for d in [png, psd, xml, svgish] { #expect(!QRScannerEngine.isSVG(d)) }
+    @Test func otherInputsAreNotSVG() {
+        for (name, d) in Self.notSVG { #expect(!QRScannerEngine.isSVG(d), "\(name)") }
     }
 
-    @Test func shortMalformedUTF8IsNotSVGAndDoesNotTrap() {
-        // fewer than three bytes that aren't UTF-8: the "cut mid-char" retry must not go negative
-        for d in [Data([0xFF]), Data([0xFF, 0xFE]), Data([0xC3]), Data()] {
-            #expect(!QRScannerEngine.isSVG(d))
-        }
-        #expect(!QRScannerEngine.isSVG(Data("<!DOCTYPE svg [<!ENTITY x \"v\">".utf8)))  // unterminated
+    @Test func everyDocumentRoutedToSVGIsOneNSImageRenders() {
+        // isSVG and NSImage both read XML with libxml2: what we route there, it can draw.
+        for (name, d) in Self.svg { #expect(NSImage(data: d) != nil, "\(name)") }
     }
 
-    @Test func aLongPrologStillFindsTheRoot() {
-        // the root can sit well past the first 4 KiB: a long comment, then a long DOCTYPE subset
-        let comment = "<!-- " + String(repeating: "x", count: 10_000) + " -->"
-        let entities = (0..<300).map { "<!ENTITY e\($0) \"\($0)\">" }.joined()
-        let doc = "<?xml version=\"1.0\"?>\(comment)<!DOCTYPE svg [\(entities)]>\n<svg width=\"1\"/>"
-        #expect(Data(doc.utf8).count > 3 * 4096)
-        #expect(QRScannerEngine.isSVG(Data(doc.utf8)))
-        // non-ASCII inside a comment is fine; the scan never decodes UTF-8
-        #expect(QRScannerEngine.isSVG(Data("<!-- café ☕ --><svg/>".utf8)))
-    }
-
-    @Test func utf16SVGIsSVG() {
-        let doc = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<svg width=\"1\"/>"
-        for enc in [String.Encoding.utf16LittleEndian, .utf16BigEndian] {
-            let bare = doc.data(using: enc)!
-            #expect(QRScannerEngine.isSVG(bare))                                   // no BOM
-            let bom: [UInt8] = enc == .utf16LittleEndian ? [0xFF, 0xFE] : [0xFE, 0xFF]
-            #expect(QRScannerEngine.isSVG(Data(bom) + bare))                        // with BOM
-        }
-        // UTF-16 whose root isn't svg, and odd-length / unpaired-surrogate UTF-16, are not SVG
-        #expect(!QRScannerEngine.isSVG("<html><svg/></html>".data(using: .utf16LittleEndian)!))
-        #expect(!QRScannerEngine.isSVG(Data([0xFF, 0xFE, 0x3C, 0x00, 0x73])))
-        #expect(!QRScannerEngine.isSVG(Data([0xFF, 0xFE, 0x00, 0xD8, 0x3C, 0x00])))
-    }
-
-    @Test func utf32SVGIsSVG() {
-        let doc = "<?xml version=\"1.0\" encoding=\"UTF-32\"?>\n<svg width=\"1\"/>"
-        for (enc, bom) in [(String.Encoding.utf32LittleEndian, [UInt8]([0xFF, 0xFE, 0, 0])),
-                           (.utf32BigEndian, [0, 0, 0xFE, 0xFF])] {
-            let bare = doc.data(using: enc)!
-            #expect(QRScannerEngine.isSVG(bare))
-            #expect(QRScannerEngine.isSVG(Data(bom) + bare))
-        }
-        #expect(!QRScannerEngine.isSVG("<html><svg/></html>".data(using: .utf32LittleEndian)!))
-        #expect(!QRScannerEngine.isSVG(Data([0xFF, 0xFE, 0, 0, 0x3C, 0, 0])))   // truncated
-    }
-
-    @Test func namespacePrefixedRootsAreSVGOnlyWithTheSVGNamespace() {
-        for doc in ["<svg:svg xmlns:svg=\"http://www.w3.org/2000/svg\" width=\"1\"/>",
-                    "<?xml version=\"1.0\"?>\n<s:svg\n  version='1.1' xmlns:s = 'http://www.w3.org/2000/svg'>"] {
-            #expect(QRScannerEngine.isSVG(Data(doc.utf8)), "\(doc)")
-        }
-        for doc in ["<svg:svg/>",                                                  // unbound prefix
-                    "<x:svg xmlns:x=\"urn:not-svg\"/>",                         // other namespace
-                    "<x:svg xmlns:y=\"http://www.w3.org/2000/svg\"/>",          // wrong prefix
-                    "<svg:svgx xmlns:svg=\"http://www.w3.org/2000/svg\"/>",     // local name isn't svg
-                    ":svg xmlns:=\"http://www.w3.org/2000/svg\"",
-                    "<:svg xmlns:=\"http://www.w3.org/2000/svg\"/>",            // empty prefix
-                    "<svg:svg a=\"x\">xmlns:svg=\"http://www.w3.org/2000/svg\"", // outside the tag
-                    "<svg:svg xmlns:svg=\"http://www.w3.org/2000/svg"] {         // unterminated
-            #expect(!QRScannerEngine.isSVG(Data(doc.utf8)), "\(doc)")
-        }
-    }
-
-    @Test func bracketsInsideDoctypeCommentsAndPIsAreSkipped() {
-        for doc in ["<!DOCTYPE svg [<!-- ] --><!ELEMENT svg ANY>]><svg/>",
-                    "<!DOCTYPE svg [<!-- > ]> --><!ENTITY x \"v\">]>\n<svg/>",
-                    "<!DOCTYPE svg [<?pi ]> ?><!ELEMENT svg ANY>]><svg/>"] {
-            #expect(QRScannerEngine.isSVG(Data(doc.utf8)), "\(doc)")
-        }
-        #expect(!QRScannerEngine.isSVG(Data("<!DOCTYPE svg [<!-- ]><svg/>".utf8)))  // unterminated
+    @Test func inputTypeLabelsWhatTheScannerAccepts() {
+        for (name, d) in Self.svg { #expect(QRScannerEngine.inputType(d) == "svg", "\(name)") }
+        #expect(QRScannerEngine.inputType(Self.notSVG[0].1) == "png")  // "<svg" in a PNG: still a PNG
+        #expect(QRScannerEngine.inputType(Data("%PDF-1.7\n".utf8)) == "pdf")
+        #expect(QRScannerEngine.inputType(Self.u("<html/>")) == nil)
+        for label in ["svg", "pdf", "png", "jpeg"] { #expect(QRScannerEngine.inputMIMEs[label] != nil) }
     }
 }

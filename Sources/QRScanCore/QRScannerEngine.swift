@@ -272,9 +272,7 @@ public actor QRScannerEngine {
 
     /// Raster types handed to ImageIO. Everything else ImageIO could parse (RAW, EXR, ICNS, PSD,
     /// TGA, …) is refused: each extra decoder is attack surface this service doesn't need.
-    private static let rasterTypes: Set<String> = [
-        UTType.png, .jpeg, .heic, .heif, .webP, .tiff, .gif, .bmp,
-    ].reduce(into: Set<String>()) { $0.insert($1.identifier) }
+    private static var rasterTypes: Set<String> { Set(rasterLabels.keys) }
 
     static func loadImage(from data: Data) throws -> CGImage {
         if isSVG(data) {
@@ -305,176 +303,62 @@ public actor QRScannerEngine {
         return image
     }
 
-    /// SVG only if the document's first element is `<svg` (or `<p:svg` with `xmlns:p` bound to
-    /// the SVG namespace): after an optional BOM, whitespace,
-    /// an XML declaration / processing instructions, comments and a DOCTYPE -- nothing else.
+    /// SVG only if the document's root element is `svg` in the SVG namespace (or unprefixed
+    /// with no namespace, which NSImage also renders). Decided by Foundation's XMLParser --
+    /// libxml2, the same parser NSImage's SVG path uses -- so encodings, character and entity
+    /// references and DTD subsets are read exactly as the renderer reads them. It stops at the
+    /// root, never resolves external entities, and libxml2 refuses entity-expansion bombs.
     /// (A substring test would send a PNG or PSD with "<svg" in a text chunk to NSImage, which
-    /// auto-detects the real format and skips the raster allowlist and pixel limit.) Scans raw
-    /// bytes over the whole input, so a long prolog still finds the root and no UTF-8 decoding
-    /// (or a copy of a large image) is needed; a binary format fails on its first byte.
-    public static func isSVG(_ data: Data) -> Bool {
-        // XML may also be UTF-16 (BOM, or `<` interleaved with NUL); transcode and scan that.
-        if let utf8 = wideAsUTF8(data) { return svgRoot(utf8) }
-        return svgRoot(data)
+    /// auto-detects the real format and skips the raster allowlist and pixel limit.)
+    static func isSVG(_ data: Data) -> Bool {
+        let parser = XMLParser(data: data)
+        let root = RootElement()
+        parser.delegate = root
+        parser.shouldProcessNamespaces = true
+        parser.shouldReportNamespacePrefixes = false
+        parser.shouldResolveExternalEntities = false
+        _ = parser.parse()
+        guard let r = root.found, r.local == "svg" else { return false }
+        if r.namespace == svgNamespace { return true }
+        return (r.namespace ?? "").isEmpty && r.qualified == "svg"
     }
 
-    /// UTF-32 / UTF-16 XML (per the XML spec's encoding detection: a BOM, or `<` padded with
-    /// NUL bytes) as UTF-8, or nil when the input is neither. 4-byte signatures are checked
-    /// first (`FF FE 00 00` is UTF-32LE, not UTF-16LE). Malformed input is not SVG.
-    static func wideAsUTF8(_ data: Data) -> Data? {
-        let h = [UInt8](data.prefix(4))
-        let table: [([UInt8], String.Encoding, Int)] = [
-            ([0xFF, 0xFE, 0x00, 0x00], .utf32LittleEndian, 4),
-            ([0x00, 0x00, 0xFE, 0xFF], .utf32BigEndian, 4),
-            ([0x3C, 0x00, 0x00, 0x00], .utf32LittleEndian, 0),
-            ([0x00, 0x00, 0x00, 0x3C], .utf32BigEndian, 0),
-            ([0xFF, 0xFE], .utf16LittleEndian, 2),
-            ([0xFE, 0xFF], .utf16BigEndian, 2),
-            ([0x3C, 0x00], .utf16LittleEndian, 0),
-            ([0x00, 0x3C], .utf16BigEndian, 0),
-        ]
-        guard let (_, enc, bom) = table.first(where: { h.starts(with: $0.0) }) else { return nil }
-        let unit = enc == .utf32LittleEndian || enc == .utf32BigEndian ? 4 : 2
-        let body = data.dropFirst(bom)
-        guard body.count % unit == 0, let text = String(data: Data(body), encoding: enc) else {
-            return Data()   // looked wide but isn't valid: scanned as empty -> not SVG
-        }
-        return Data(text.utf8)
-    }
+    static let svgNamespace = "http://www.w3.org/2000/svg"
 
-    private static func svgRoot(_ data: Data) -> Bool {
-        data.withUnsafeBytes { raw -> Bool in
-            let b = raw.bindMemory(to: UInt8.self)
-            var i = 0
-            if b.count >= 3, b[0] == 0xEF, b[1] == 0xBB, b[2] == 0xBF { i = 3 }
-            func at(_ s: String) -> Bool {
-                let u = Array(s.utf8)
-                guard i + u.count <= b.count else { return false }
-                for k in 0..<u.count where b[i + k] != u[k] { return false }
-                return true
-            }
-            func atDoctype() -> Bool {
-                let u = Array("<!doctype".utf8)
-                guard i + u.count <= b.count else { return false }
-                for k in 0..<u.count where b[i + k] | (k >= 2 ? 0x20 : 0) != u[k] { return false }
-                return true
-            }
-            func skip(past end: String) -> Bool {   // moves i just past `end`
-                let u = Array(end.utf8)
-                while i + u.count <= b.count {
-                    if at(end) { i += u.count; return true }
-                    i += 1
-                }
-                return false
-            }
-            while true {
-                while i < b.count, [0x20, 0x09, 0x0A, 0x0D].contains(b[i]) { i += 1 }
-                if at("<?") {
-                    guard skip(past: "?>") else { return false }
-                } else if at("<!--") {
-                    guard skip(past: "-->") else { return false }
-                } else if atDoctype() {
-                    guard let end = doctypeEnd(b, from: i) else { return false }
-                    i = end
-                } else {
-                    break
-                }
-            }
-            guard i < b.count, b[i] == UInt8(ascii: "<") else { return false }
-            // The root's qualified name runs to whitespace, '>' or '/'.
-            let nameStart = i + 1
-            var j = nameStart
-            while j < b.count, ![0x20, 0x09, 0x0A, 0x0D, UInt8(ascii: ">"), UInt8(ascii: "/")].contains(b[j]) {
-                j += 1
-            }
-            let name = Array(b[nameStart..<j])
-            if name == Array("svg".utf8) { return true }
-            // `<p:svg ...>` is SVG only when the tag binds `xmlns:p` to the SVG namespace.
-            guard let colon = name.firstIndex(of: UInt8(ascii: ":")), colon > 0,
-                  Array(name[(colon + 1)...]) == Array("svg".utf8)
-            else { return false }
-            let prefix = Array(name[..<colon])
-            return tagBinds(b, from: j, attribute: Array("xmlns:".utf8) + prefix,
-                            to: Array("http://www.w3.org/2000/svg".utf8))
+    private final class RootElement: NSObject, XMLParserDelegate {
+        var found: (local: String, qualified: String?, namespace: String?)?
+        func parser(_ parser: XMLParser, didStartElement name: String, namespaceURI: String?,
+                    qualifiedName: String?, attributes: [String: String] = [:]) {
+            found = (name, qualifiedName, namespaceURI)
+            parser.abortParsing()
         }
     }
 
-    /// Whether the start tag whose attributes begin at `start` has `attribute="value"` (either
-    /// quote, optional whitespace around '='). Stops at the tag's closing '>'.
-    private static func tagBinds(_ b: UnsafeBufferPointer<UInt8>, from start: Int,
-                                 attribute: [UInt8], to value: [UInt8]) -> Bool {
-        let ws: [UInt8] = [0x20, 0x09, 0x0A, 0x0D]
-        var i = start
-        while i < b.count {
-            while i < b.count, ws.contains(b[i]) { i += 1 }
-            guard i < b.count, b[i] != UInt8(ascii: ">"), b[i] != UInt8(ascii: "/") else { return false }
-            let n0 = i
-            while i < b.count, !ws.contains(b[i]), b[i] != UInt8(ascii: "="), b[i] != UInt8(ascii: ">") { i += 1 }
-            let attr = Array(b[n0..<i])
-            while i < b.count, ws.contains(b[i]) { i += 1 }
-            guard i < b.count, b[i] == UInt8(ascii: "=") else { return false }
-            i += 1
-            while i < b.count, ws.contains(b[i]) { i += 1 }
-            guard i < b.count, b[i] == UInt8(ascii: "\"") || b[i] == UInt8(ascii: "'") else { return false }
-            let q = b[i]
-            i += 1
-            let v0 = i
-            while i < b.count, b[i] != q { i += 1 }
-            guard i < b.count else { return false }
-            if attr == attribute, Array(b[v0..<i]) == value { return true }
-            i += 1
-        }
-        return false
-    }
+    /// Labels for the inputs the scanner accepts, with their MIME types: what the envelope's
+    /// `detected` reports. The scanner (sandboxed, it already parses the input) decides the
+    /// label; hosts only check it is one of these.
+    public static let inputMIMEs: [String: String] = [
+        "png": "image/png", "jpeg": "image/jpeg", "gif": "image/gif", "tiff": "image/tiff",
+        "bmp": "image/bmp", "webp": "image/webp", "heic": "image/heic",
+        "pdf": "application/pdf", "svg": "image/svg+xml",
+    ]
 
-    /// Just past a DOCTYPE's closing `>`, skipping an internal subset (`[ ... ]`, whose entity
-    /// and element declarations have their own `>`), quoted literals, and comments and
-    /// processing instructions inside the subset (which may contain `]` or `>`).
-    private static func doctypeEnd(_ b: UnsafeBufferPointer<UInt8>, from start: Int) -> Int? {
-        var quote: UInt8? = nil
-        var depth = 0
-        var i = start
-        func at(_ s: String, _ j: Int) -> Bool {
-            let u = Array(s.utf8)
-            guard j + u.count <= b.count else { return false }
-            for k in 0..<u.count where b[j + k] != u[k] { return false }
-            return true
-        }
-        func past(_ end: String, from j: Int) -> Int? {
-            var j = j
-            let n = end.utf8.count
-            while j + n <= b.count {
-                if at(end, j) { return j + n }
-                j += 1
-            }
-            return nil
-        }
-        while i < b.count {
-            let c = b[i]
-            if quote == nil, depth > 0, at("<!--", i) {
-                guard let e = past("-->", from: i + 4) else { return nil }
-                i = e
-                continue
-            }
-            if quote == nil, depth > 0, at("<?", i) {
-                guard let e = past("?>", from: i + 2) else { return nil }
-                i = e
-                continue
-            }
-            if let q = quote {
-                if c == q { quote = nil }
-            } else if c == UInt8(ascii: "\"") || c == UInt8(ascii: "'") {
-                quote = c
-            } else if c == UInt8(ascii: "[") {
-                depth += 1
-            } else if c == UInt8(ascii: "]") {
-                depth = max(0, depth - 1)
-            } else if c == UInt8(ascii: ">") && depth == 0 {
-                return i + 1
-            }
-            i += 1
-        }
-        return nil
+    private static let rasterLabels: [String: String] = [
+        UTType.png.identifier: "png", UTType.jpeg.identifier: "jpeg", UTType.gif.identifier: "gif",
+        UTType.tiff.identifier: "tiff", UTType.bmp.identifier: "bmp", UTType.webP.identifier: "webp",
+        UTType.heic.identifier: "heic", UTType.heif.identifier: "heic",
+    ]
+
+    /// The `inputMIMEs` label of an input the scanner would accept, by the same tests
+    /// `loadImage` routes on; nil when it would be refused.
+    public static func inputType(_ data: Data) -> String? {
+        if isSVG(data) { return "svg" }
+        if isPDF(data) { return "pdf" }
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, options),
+              let type = CGImageSourceGetType(source) as String?
+        else { return nil }
+        return rasterLabels[type]
     }
 
     private static func isPDF(_ data: Data) -> Bool {

@@ -25,15 +25,19 @@ public struct ScanOutput: Codable, Sendable {
     public let compute: String?
     public let report: ScanReport?
     public let error: ScanErrorBody?
+    /// What the input was (a `QRScannerEngine.inputMIMEs` label), when it is a type the scanner
+    /// accepts; the envelope's `detected` comes from here.
+    public let inputType: String?
 
     public init(schema: String, ok: Bool, mode: String?, compute: String?, report: ScanReport?,
-                error: ScanErrorBody?) {
+                error: ScanErrorBody?, inputType: String? = nil) {
         self.schema = schema
         self.ok = ok
         self.mode = mode
         self.compute = compute
         self.report = report
         self.error = error
+        self.inputType = inputType
     }
 }
 
@@ -67,9 +71,10 @@ public enum ScanJob {
     public static func scan(data: Data, heavy: Bool, configJSON: String?,
                             compute: ComputePreference) async -> (ScanOutput, ScanExit) {
         let mode = heavy ? "heavy" : "default"
+        let inputType = QRScannerEngine.inputType(data)
         func fail(_ code: String, _ message: String, _ exit: ScanExit) -> (ScanOutput, ScanExit) {
             (ScanOutput(schema: scanSchema, ok: false, mode: mode, compute: nil, report: nil,
-                        error: ScanErrorBody(code: code, message: message)), exit)
+                        error: ScanErrorBody(code: code, message: message), inputType: inputType), exit)
         }
         var config = heavy ? MutationConfig.heavy : MutationConfig.default
         if let configJSON {
@@ -84,7 +89,7 @@ public enum ScanJob {
             let report = try await QRScannerEngine(compute: compute)
                 .scan(imageData: data, config: config, earlyExit: !heavy)
             return (ScanOutput(schema: scanSchema, ok: true, mode: mode, compute: compute.rawValue,
-                               report: report, error: nil), .ok)
+                               report: report, error: nil, inputType: inputType), .ok)
         } catch let error as ScanError {
             return fail("invalid_image", error.localizedDescription, .badInput)
         } catch {

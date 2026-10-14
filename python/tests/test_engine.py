@@ -20,7 +20,7 @@ from blastbox.limits import Limits
 from blastbox.worker.sandbox.base import SandboxResult
 
 from william_tells import blastbox_engine as wt
-from william_tells.blastbox_engine import WilliamTellsEngine, is_svg, parse_scan_output, sniff
+from william_tells.blastbox_engine import WilliamTellsEngine, parse_scan_output, sniff
 
 REPO = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get("WTQRK_SCAN_BIN") or REPO / ".build" / "release" / "wtqrk-scan")
@@ -314,57 +314,29 @@ class TestRealAppSandbox:
         assert env.payload.fields["payloads"] == [msg]
 
 
-# Same vectors as the Swift SVGDetectionTests: the envelope label must match what the scanner accepts.
-_SVG_YES = [
-    b'<svg xmlns="http://www.w3.org/2000/svg"/>',
-    "\ufeff  <?xml version=\"1.0\"?>\n<!-- hi -->\n<!DOCTYPE svg PUBLIC \"a\" \"x\">\n<svg width=\"1\">".encode(),
-    b'<!DOCTYPE svg [<!ENTITY x "v>"><!ELEMENT svg ANY>]><svg>',
-    b"<!DOCTYPE svg [<!-- ] --><!ELEMENT svg ANY>]><svg/>",
-    b"<!DOCTYPE svg [<?pi ]> ?><!ELEMENT svg ANY>]><svg/>",
-    b'<svg:svg xmlns:svg="http://www.w3.org/2000/svg" width="1"/>',
-    b"<?xml version=\"1.0\"?>\n<s:svg\n  version='1.1' xmlns:s = 'http://www.w3.org/2000/svg'>",
-    b"<!-- " + b"x" * 10_000 + b" --><svg/>",
-    '<?xml version="1.0" encoding="UTF-16"?>\n<svg width="1"/>'.encode("utf-16-le"),
-    '<?xml version="1.0" encoding="UTF-16"?>\n<svg width="1"/>'.encode("utf-16-be"),
-    b"\xff\xfe" + "<svg/>".encode("utf-16-le"),
-    b"\xfe\xff" + "<svg/>".encode("utf-16-be"),
-    "<?xml version=\"1.0\"?><svg/>".encode("utf-32-le"),
-    "<?xml version=\"1.0\"?><svg/>".encode("utf-32-be"),
-    b"\xff\xfe\0\0" + "<svg/>".encode("utf-32-le"),
-    b"\0\0\xfe\xff" + "<svg/>".encode("utf-32-be"),
-]
-_SVG_NO = [
-    b"\x89PNG\r\n\x1a\n\0\0\0\x10tEXtComment\0<svg>",
-    b"<?xml version=\"1.0\"?><html><svg/></html>",
-    b"<svgfoo/>",
-    b"<svg:svg/>",
-    b'<x:svg xmlns:x="urn:not-svg"/>',
-    b'<x:svg xmlns:y="http://www.w3.org/2000/svg"/>',
-    b'<:svg xmlns:="http://www.w3.org/2000/svg"/>',
-    b'<svg:svg a="x">xmlns:svg="http://www.w3.org/2000/svg"',
-    b"<!DOCTYPE svg [<!-- ]><svg/>",
-    b"\xff\xfe<\0s",
-    b"\xff\xfe\0\xd8<\0",
-    b"\xff\xfe\0\0<\0\0",                       # truncated UTF-32
-    "<html><svg/></html>".encode("utf-32-le"),
-    b"", b"\xff", b"\xc3",
-]
-
-
-@pytest.mark.parametrize("doc", _SVG_YES)
-def test_every_svg_the_scanner_accepts_is_labelled_svg(doc):
-    assert is_svg(doc)
-    assert sniff(doc) == ("svg", "image/svg+xml")
-
-
-@pytest.mark.parametrize("doc", _SVG_NO)
-def test_non_svg_is_not_labelled_svg(doc):
-    assert not is_svg(doc)
-    assert sniff(doc)[0] != "svg"
-
-
-def test_detected_label_sees_an_svg_root_past_1kib(tmp_path):
+# `detected` for a completed scan is the type the (sandboxed) scanner reported; the host only
+# sniffs magic numbers and never parses XML itself.
+def test_a_completed_scan_is_labelled_with_the_scanners_input_type(tmp_path):
     doc = b"<!-- " + b"x" * 4000 + b' --><svg:svg xmlns:svg="http://www.w3.org/2000/svg"/>'
-    eng, _ = _engine(tmp_path, _ok_doc([DET]))
+    eng, _ = _engine(tmp_path, _ok_doc([DET], inputType="svg"))
     res = eng.detonate(_input(tmp_path, doc), tmp_path, Limits())
-    assert res.detected.label == "svg" and res.detected.mime == "image/svg+xml"
+    assert res.status == "ok"
+    assert (res.detected.label, res.detected.mime, res.detected.confidence) == (
+        "svg", "image/svg+xml", 1.0)
+
+
+def test_without_an_input_type_the_label_is_the_magic_sniff(tmp_path):
+    eng, _ = _engine(tmp_path, _ok_doc([DET]))
+    res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+    assert res.detected.label == "png"
+    assert sniff(b"<svg/>")[0] == "unknown"           # no XML parsing on the host
+    assert sniff(b"\x89PNG\r\n\x1a\n<svg>")[0] == "png"
+
+
+@pytest.mark.parametrize("bad", ["exe", 7, "../svg", ["svg"]])
+def test_an_unknown_input_type_is_bad_output(tmp_path, bad):
+    with pytest.raises(ValueError, match="inputType"):
+        parse_scan_output(_ok_doc([DET], inputType=bad))
+    eng, _ = _engine(tmp_path, _ok_doc([DET], inputType=bad))
+    res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+    assert res.status == "engine_error" and res.warnings[0].code == "bad_scanner_output"
