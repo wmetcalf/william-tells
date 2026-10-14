@@ -191,7 +191,7 @@ final class Agent: Sendable {
 
             let outcome = await run(inputPath: input.path, params: params)
             let meta = try BlastboxEnvelope.metadataJSON(
-                BlastboxEnvelope.envelope(outcome: outcome, inputSHA256: sha, head: body.prefix(1024)))
+                BlastboxEnvelope.envelope(outcome: outcome, inputSHA256: sha, input: body))
             let metaCap = int(params["BLASTBOX_MAX_METADATA"], default: 4 << 20)
             guard meta.count <= metaCap else {
                 return Agent.json(.internalServerError, ["error": "engine_error"])

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import QRScanCore
 
 // The blastbox worker contract, for the native agent: the `metadata.json` envelope the host's
 // trust gate re-validates (blastbox `contract/envelope.py`), and the tar it arrives in. The
@@ -11,8 +12,10 @@ public enum BlastboxEnvelope {
     public static let schema = "wtqrk.scan/1"
 
     /// File-type sniff for the envelope's `detected` (the scanner enforces the real allowlist).
-    public static func sniff(_ head: Data) -> (label: String, mime: String) {
-        let b = [UInt8](head.prefix(1024))
+    /// Magic numbers come from the first 1 KiB; SVG uses the scanner's own root test over the
+    /// whole input, so every SVG the scanner accepts is labelled as one.
+    public static func sniff(_ input: Data) -> (label: String, mime: String) {
+        let b = [UInt8](input.prefix(1024))
         func at(_ off: Int, _ magic: [UInt8]) -> Bool {
             b.count >= off + magic.count && Array(b[off..<off + magic.count]) == magic
         }
@@ -33,7 +36,7 @@ public enum BlastboxEnvelope {
                 return ("heic", "image/heic")
             }
         }
-        if String(decoding: b, as: UTF8.self).lowercased().contains("<svg") { return ("svg", "image/svg+xml") }
+        if QRScannerEngine.isSVG(input) { return ("svg", "image/svg+xml") }
         return ("unknown", "application/octet-stream")
     }
 
@@ -46,8 +49,8 @@ public enum BlastboxEnvelope {
     }
 
     /// The sealed envelope for one scan outcome.
-    public static func envelope(outcome: ScanOutcome, inputSHA256: String, head: Data) -> [String: Any] {
-        let (label, mime) = sniff(head)
+    public static func envelope(outcome: ScanOutcome, inputSHA256: String, input: Data) -> [String: Any] {
+        let (label, mime) = sniff(input)
         let detected: [String: Any] = ["label": label, "mime": mime,
                                        "confidence": label == "unknown" ? 0.0 : 1.0, "source": engine]
         func env(status: String, fields: [String: Any], warnings: [ScanWarning]) -> [String: Any] {

@@ -247,6 +247,28 @@ struct SandboxedScannerTests {
     }
 }
 
+@Suite struct EnvelopeSniffTests {
+    @Test func everySVGTheScannerAcceptsIsLabelledSVG() {
+        let ns = "http://www.w3.org/2000/svg"
+        let docs: [Data] = [
+            "<svg:svg xmlns:svg=\"\(ns)\"/>".data(using: .utf8)!,
+            "<?xml version=\"1.0\"?><svg/>".data(using: .utf16LittleEndian)!,
+            Data([0xFE, 0xFF]) + "<svg/>".data(using: .utf16BigEndian)!,
+            ("<!-- " + String(repeating: "x", count: 4000) + " --><svg/>").data(using: .utf8)!,
+        ]
+        for d in docs {
+            #expect(BlastboxEnvelope.sniff(d) == ("svg", "image/svg+xml"))
+            let env = BlastboxEnvelope.envelope(outcome: .rejected(code: "x", message: ""),
+                                                inputSHA256: "", input: d)
+            #expect((env["detected"] as? [String: Any])?["label"] as? String == "svg")
+        }
+        // "<svg" in a PNG text chunk is still a PNG; an XML doc with a non-svg root isn't SVG
+        var png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]); png.append(Data("<svg>".utf8))
+        #expect(BlastboxEnvelope.sniff(png).label == "png")
+        #expect(BlastboxEnvelope.sniff(Data("<html><svg/></html>".utf8)).label == "unknown")
+    }
+}
+
 @Suite struct ScannerOutcomeTests {
     @Test func okOutputFromAFailedExitIsAnEngineError() throws {
         let doc = #"{"schema":"wtqrk.scan/1","ok":true,"mode":"default","compute":"auto","report":{"imageDimensions":{"width":1,"height":1},"mutationsTried":0,"detections":[]}}"#

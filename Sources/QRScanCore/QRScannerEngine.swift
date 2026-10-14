@@ -312,7 +312,7 @@ public actor QRScannerEngine {
     /// auto-detects the real format and skips the raster allowlist and pixel limit.) Scans raw
     /// bytes over the whole input, so a long prolog still finds the root and no UTF-8 decoding
     /// (or a copy of a large image) is needed; a binary format fails on its first byte.
-    static func isSVG(_ data: Data) -> Bool {
+    public static func isSVG(_ data: Data) -> Bool {
         // XML may also be UTF-16 (BOM, or `<` interleaved with NUL); transcode and scan that.
         if let utf8 = utf16AsUTF8(data) { return svgRoot(utf8) }
         return svgRoot(data)

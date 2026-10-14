@@ -86,10 +86,127 @@ def sniff(head: bytes) -> tuple[str, str]:
         return "webp", "image/webp"
     if head[4:8] == b"ftyp" and head[8:12] in (b"heic", b"heix", b"mif1", b"msf1", b"heim", b"heis"):
         return "heic", "image/heic"
-    text = head[:1024].lower()
-    if b"<svg" in text:
+    if is_svg(head):
         return "svg", "image/svg+xml"
     return "unknown", "application/octet-stream"
+
+
+_SVG_NS = b"http://www.w3.org/2000/svg"
+_WS = b" \t\n\r"
+
+
+def is_svg(data: bytes) -> bool:
+    """The scanner's SVG test (QRScannerEngine.isSVG), so `detected` labels every SVG it accepts.
+
+    The first element must be ``svg`` (or ``p:svg`` with ``xmlns:p`` bound to the SVG namespace
+    on that tag), after an optional BOM, whitespace, PIs, comments and a DOCTYPE. UTF-16 XML (BOM,
+    or ``<`` interleaved with NUL) is transcoded first; malformed UTF-16 is not SVG.
+    """
+    enc = {b"\xff\xfe": "utf-16-le", b"\xfe\xff": "utf-16-be",
+           b"<\0": "utf-16-le", b"\0<": "utf-16-be"}.get(data[:2])
+    if enc:
+        body = data[2:] if data[:2] in (b"\xff\xfe", b"\xfe\xff") else data
+        try:
+            data = body.decode(enc).encode()
+        except UnicodeDecodeError:
+            return False
+    i = 3 if data.startswith(b"\xef\xbb\xbf") else 0
+    n = len(data)
+    while True:
+        while i < n and data[i] in _WS:
+            i += 1
+        if data.startswith(b"<?", i):
+            j = data.find(b"?>", i + 2)
+            if j < 0:
+                return False
+            i = j + 2
+        elif data.startswith(b"<!--", i):
+            j = data.find(b"-->", i + 4)
+            if j < 0:
+                return False
+            i = j + 3
+        elif data[i:i + 9].lower() == b"<!doctype" and data.startswith(b"<!", i):
+            end = _doctype_end(data, i)
+            if end is None:
+                return False
+            i = end
+        else:
+            break
+    if not data.startswith(b"<", i):
+        return False
+    j = i + 1
+    while j < n and data[j] not in _WS and data[j] not in b">/":
+        j += 1
+    name = data[i + 1:j]
+    if name == b"svg":
+        return True
+    prefix, colon, local = name.partition(b":")
+    if not colon or not prefix or local != b"svg":
+        return False
+    return _tag_binds(data, j, b"xmlns:" + prefix, _SVG_NS)
+
+
+def _doctype_end(b: bytes, i: int) -> int | None:
+    quote = None
+    depth = 0
+    n = len(b)
+    while i < n:
+        if quote is None and depth > 0 and b.startswith(b"<!--", i):
+            j = b.find(b"-->", i + 4)
+            if j < 0:
+                return None
+            i = j + 3
+            continue
+        if quote is None and depth > 0 and b.startswith(b"<?", i):
+            j = b.find(b"?>", i + 2)
+            if j < 0:
+                return None
+            i = j + 2
+            continue
+        c = b[i:i + 1]
+        if quote is not None:
+            if c == quote:
+                quote = None
+        elif c in (b'"', b"'"):
+            quote = c
+        elif c == b"[":
+            depth += 1
+        elif c == b"]":
+            depth = max(0, depth - 1)
+        elif c == b">" and depth == 0:
+            return i + 1
+        i += 1
+    return None
+
+
+def _tag_binds(b: bytes, i: int, attribute: bytes, value: bytes) -> bool:
+    n = len(b)
+    while i < n:
+        while i < n and b[i] in _WS:
+            i += 1
+        if i >= n or b[i:i + 1] in (b">", b"/"):
+            return False
+        a0 = i
+        while i < n and b[i] not in _WS and b[i:i + 1] not in (b"=", b">"):
+            i += 1
+        attr = b[a0:i]
+        while i < n and b[i] in _WS:
+            i += 1
+        if b[i:i + 1] != b"=":
+            return False
+        i += 1
+        while i < n and b[i] in _WS:
+            i += 1
+        q = b[i:i + 1]
+        if q not in (b'"', b"'"):
+            return False
+        end = b.find(q, i + 1)
+        if end < 0:
+            return False
+        if attr == attribute and b[i + 1:end] == value:
+            return True
+        i = end + 1
+    return False
 
 
 def _validate_config(raw: str) -> str:
@@ -255,8 +372,9 @@ class WilliamTellsEngine:
 
     # ------------------------------------------------------------------
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+        # The whole (size-capped) input: SVG detection needs the root, which may sit past 1 KiB.
         with input.open("rb") as fh:
-            head = fh.read(1024)
+            head = fh.read(limits.max_input_bytes + 1)
         label, mime = sniff(head)
         detected = Detection(label=label, mime=mime, confidence=1.0 if label != "unknown" else 0.0,
                              source=ENGINE_NAME)
