@@ -182,6 +182,23 @@ private func pngBomb(width: UInt32, height: UInt32) -> Data? {
         #expect(!QRScannerEngine.isSVG(Data([0xFF, 0xFE, 0x00, 0xD8, 0x3C, 0x00])))
     }
 
+    @Test func namespacePrefixedRootsAreSVGOnlyWithTheSVGNamespace() {
+        for doc in ["<svg:svg xmlns:svg=\"http://www.w3.org/2000/svg\" width=\"1\"/>",
+                    "<?xml version=\"1.0\"?>\n<s:svg\n  version='1.1' xmlns:s = 'http://www.w3.org/2000/svg'>"] {
+            #expect(QRScannerEngine.isSVG(Data(doc.utf8)), "\(doc)")
+        }
+        for doc in ["<svg:svg/>",                                                  // unbound prefix
+                    "<x:svg xmlns:x=\"urn:not-svg\"/>",                         // other namespace
+                    "<x:svg xmlns:y=\"http://www.w3.org/2000/svg\"/>",          // wrong prefix
+                    "<svg:svgx xmlns:svg=\"http://www.w3.org/2000/svg\"/>",     // local name isn't svg
+                    ":svg xmlns:=\"http://www.w3.org/2000/svg\"",
+                    "<:svg xmlns:=\"http://www.w3.org/2000/svg\"/>",            // empty prefix
+                    "<svg:svg a=\"x\">xmlns:svg=\"http://www.w3.org/2000/svg\"", // outside the tag
+                    "<svg:svg xmlns:svg=\"http://www.w3.org/2000/svg"] {         // unterminated
+            #expect(!QRScannerEngine.isSVG(Data(doc.utf8)), "\(doc)")
+        }
+    }
+
     @Test func bracketsInsideDoctypeCommentsAndPIsAreSkipped() {
         for doc in ["<!DOCTYPE svg [<!-- ] --><!ELEMENT svg ANY>]><svg/>",
                     "<!DOCTYPE svg [<!-- > ]> --><!ENTITY x \"v\">]>\n<svg/>",

@@ -305,7 +305,8 @@ public actor QRScannerEngine {
         return image
     }
 
-    /// SVG only if the document's first element is `<svg`: after an optional BOM, whitespace,
+    /// SVG only if the document's first element is `<svg` (or `<p:svg` with `xmlns:p` bound to
+    /// the SVG namespace): after an optional BOM, whitespace,
     /// an XML declaration / processing instructions, comments and a DOCTYPE -- nothing else.
     /// (A substring test would send a PNG or PSD with "<svg" in a text chunk to NSImage, which
     /// auto-detects the real format and skips the raster allowlist and pixel limit.) Scans raw
@@ -375,12 +376,51 @@ public actor QRScannerEngine {
                     break
                 }
             }
-            guard at("<svg") else { return false }
-            guard i + 4 < b.count else { return true }
-            let next = b[i + 4]
-            return next == UInt8(ascii: ">") || next == UInt8(ascii: "/")
-                || [0x20, 0x09, 0x0A, 0x0D].contains(next)
+            guard i < b.count, b[i] == UInt8(ascii: "<") else { return false }
+            // The root's qualified name runs to whitespace, '>' or '/'.
+            let nameStart = i + 1
+            var j = nameStart
+            while j < b.count, ![0x20, 0x09, 0x0A, 0x0D, UInt8(ascii: ">"), UInt8(ascii: "/")].contains(b[j]) {
+                j += 1
+            }
+            let name = Array(b[nameStart..<j])
+            if name == Array("svg".utf8) { return true }
+            // `<p:svg ...>` is SVG only when the tag binds `xmlns:p` to the SVG namespace.
+            guard let colon = name.firstIndex(of: UInt8(ascii: ":")), colon > 0,
+                  Array(name[(colon + 1)...]) == Array("svg".utf8)
+            else { return false }
+            let prefix = Array(name[..<colon])
+            return tagBinds(b, from: j, attribute: Array("xmlns:".utf8) + prefix,
+                            to: Array("http://www.w3.org/2000/svg".utf8))
         }
+    }
+
+    /// Whether the start tag whose attributes begin at `start` has `attribute="value"` (either
+    /// quote, optional whitespace around '='). Stops at the tag's closing '>'.
+    private static func tagBinds(_ b: UnsafeBufferPointer<UInt8>, from start: Int,
+                                 attribute: [UInt8], to value: [UInt8]) -> Bool {
+        let ws: [UInt8] = [0x20, 0x09, 0x0A, 0x0D]
+        var i = start
+        while i < b.count {
+            while i < b.count, ws.contains(b[i]) { i += 1 }
+            guard i < b.count, b[i] != UInt8(ascii: ">"), b[i] != UInt8(ascii: "/") else { return false }
+            let n0 = i
+            while i < b.count, !ws.contains(b[i]), b[i] != UInt8(ascii: "="), b[i] != UInt8(ascii: ">") { i += 1 }
+            let attr = Array(b[n0..<i])
+            while i < b.count, ws.contains(b[i]) { i += 1 }
+            guard i < b.count, b[i] == UInt8(ascii: "=") else { return false }
+            i += 1
+            while i < b.count, ws.contains(b[i]) { i += 1 }
+            guard i < b.count, b[i] == UInt8(ascii: "\"") || b[i] == UInt8(ascii: "'") else { return false }
+            let q = b[i]
+            i += 1
+            let v0 = i
+            while i < b.count, b[i] != q { i += 1 }
+            guard i < b.count else { return false }
+            if attr == attribute, Array(b[v0..<i]) == value { return true }
+            i += 1
+        }
+        return false
     }
 
     /// Just past a DOCTYPE's closing `>`, skipping an internal subset (`[ ... ]`, whose entity
