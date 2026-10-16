@@ -79,10 +79,13 @@ public enum Runner {
         // ~20 ms (it walks every process, ~0.4 ms); the group and tree every 5 ms.
         var inContainer: Set<pid_t> = []
         var tick = 0
+        // The scanner is NOT reaped until its family has been killed: `exited` (WNOWAIT) sees the
+        // exit but leaves the zombie, which keeps holding both its pid and its process-group id.
+        // Every signal below that names `pid` or `-pid` therefore still reaches this run's
+        // processes and never a newcomer that was handed a recycled pid.
         while true {
-            let w = waitpid(pid, &status, WNOHANG)
-            if w == pid { break }
-            if w < 0 && errno != EINTR { break }
+            let state = exited(pid)
+            if state != 0 { break }
             if killed == nil {
                 if Date() >= deadline {
                     killed = "timeout"
@@ -107,18 +110,21 @@ public enum Runner {
         // unless it exec'd something else), so it is found by those. A sweep that can't empty
         // the container (something keeps forking) fails the run.
         killAll(family(pid))
-        kill(-pid, SIGKILL)
+        kill(-pid, SIGKILL)       // the unreaped leader still pins the group id (see above)
         // Only for a slot run: argv[0] is then the slot's own binary, never a shared one like
         // /bin/sh whose other users must not be swept.
         let swept = container.map { sweep(container: $0) && sweep(executable: argv[0]) } ?? true
+        // Reap only now: from here on the pid (and group id) may be reused, and nothing below
+        // signals either.
+        while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
         if killed == nil && !swept { killed = "escaped" }
         // Bounded: an escapee that survived the sweeps and holds the pipes must not hold this
         // worker. Output still open past the grace period means something escaped; the run fails.
         let drainBy = max(deadline, Date()).addingTimeInterval(2)
         let stdout = out.finish(by: drainBy), stderr = err.finish(by: drainBy)
         if killed == nil && (!stdout.complete || !stderr.complete) { killed = "escaped" }
-        let exited = (status & 0x7f) == 0
-        return RunResult(exitCode: exited ? (status >> 8) & 0xff : -1, killed: killed,
+        let normalExit = (status & 0x7f) == 0
+        return RunResult(exitCode: normalExit ? (status >> 8) & 0xff : -1, killed: killed,
                          stdout: stdout.data, stdoutTruncated: stdout.truncated, stderr: stderr.data,
                          elapsedMs: Int(Date().timeIntervalSince(t0) * 1000))
     }
@@ -141,8 +147,43 @@ public enum Runner {
         pids.reduce(0) { $0 &+ footprint($1) }
     }
 
+    /// 1 once `pid` has exited (left unreaped), 0 while it runs, -1 when it can't be waited on.
+    static func exited(_ pid: pid_t) -> Int {
+        var info = siginfo_t()
+        while true {
+            if waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0 {
+                return info.si_pid == pid ? 1 : 0
+            }
+            if errno != EINTR { return -1 }
+        }
+    }
+
+    /// Kill each of `pids` that is still the process it was when this was called: its start time
+    /// is read first and must still match at the kill, so a pid that exited and was handed to
+    /// another process in between is left alone.
     static func killAll(_ pids: Set<pid_t>) {
-        for p in pids where p > 1 { kill(p, SIGKILL) }
+        killIfSame(identities(pids))
+    }
+
+    /// `pid -> start time` for each of `pids` still alive (a pid that can't be read is dropped).
+    static func identities(_ pids: Set<pid_t>) -> [pid_t: UInt64] {
+        var out: [pid_t: UInt64] = [:]
+        for p in pids where p > 1 { if let t = startTime(p) { out[p] = t } }
+        return out
+    }
+
+    /// SIGKILL each pid whose start time still equals the one recorded for it.
+    static func killIfSame(_ ids: [pid_t: UInt64]) {
+        for (p, t) in ids where p > 1 && startTime(p) == t { kill(p, SIGKILL) }
+    }
+
+    /// When `pid` started, in microseconds since the epoch: with the pid, an identity a recycled
+    /// pid doesn't share. Nil when it has gone (or is a zombie, which needs no signal).
+    static func startTime(_ pid: pid_t) -> UInt64? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+        return info.pbi_start_tvsec &* 1_000_000 &+ info.pbi_start_tvusec
     }
 
     /// Kill every process whose executable is `executable` (a slot's scanner), and wait for them
@@ -177,9 +218,15 @@ public enum Runner {
     static func sweep(_ matches: (pid_t) -> Bool) -> Bool {
         let me = getpid()
         for _ in 0..<200 {
-            let stray = listPids(type: UInt32(PROC_ALL_PIDS), arg: 0).filter { $0 != me && matches($0) }
+            // The start time is read BEFORE the match and must be unchanged after it, so the
+            // process killed is the one that matched, not a successor that took its pid.
+            var stray: [pid_t: UInt64] = [:]
+            for p in listPids(type: UInt32(PROC_ALL_PIDS), arg: 0) where p != me {
+                guard let t = startTime(p), matches(p), startTime(p) == t else { continue }
+                stray[p] = t
+            }
             if stray.isEmpty { return true }
-            killAll(Set(stray))
+            killIfSame(stray)
             usleep(5_000)
         }
         return listPids(type: UInt32(PROC_ALL_PIDS), arg: 0).allSatisfy { $0 == me || !matches($0) }

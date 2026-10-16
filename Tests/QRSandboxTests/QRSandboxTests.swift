@@ -319,3 +319,49 @@ enum StaticScannerOutcome {
         return false
     }
 }
+
+// MARK: - kills are identity-checked
+
+@Suite struct PidIdentityTests {
+    func sleeper() throws -> Process {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        p.arguments = ["30"]
+        try p.run()
+        return p
+    }
+
+    @Test func aPidWhoseStartTimeChangedIsNotSignalled() throws {
+        // The recorded identity is not this process's (as if the pid had been recycled).
+        let p = try sleeper()
+        defer { kill(p.processIdentifier, SIGKILL); p.waitUntilExit() }
+        let real = try #require(Runner.startTime(p.processIdentifier))
+        Runner.killIfSame([p.processIdentifier: real &+ 1])
+        usleep(50_000)
+        #expect(p.isRunning)
+        Runner.killIfSame([p.processIdentifier: real])
+        p.waitUntilExit()
+        #expect(p.terminationReason == .uncaughtSignal)
+    }
+
+    @Test func exitIsSeenWithoutReapingSoThePidStaysReserved() throws {
+        var pid: pid_t = 0
+        let argv = ["/usr/bin/true"]
+        let rc = Runner.withCStrings(argv) { posix_spawn(&pid, argv[0], nil, nil, $0, nil) }
+        try #require(rc == 0)
+        var state = 0
+        for _ in 0..<400 where state == 0 { state = Runner.exited(pid); if state == 0 { usleep(5_000) } }
+        #expect(state == 1)
+        // Still a zombie of ours: it can be seen again and is only gone once reaped.
+        #expect(Runner.exited(pid) == 1)
+        var status: Int32 = 0
+        #expect(waitpid(pid, &status, 0) == pid)
+        #expect(Runner.exited(pid) == -1)
+    }
+
+    @Test func aRunStillReportsTheScannersExitStatus() throws {
+        let r = try Runner.run(["/bin/sh", "-c", "exit 3"], stdinFD: open("/dev/null", O_RDONLY),
+                               limits: RunLimits(timeoutSeconds: 10))
+        #expect(r.killed == nil && r.exitCode == 3)
+    }
+}
