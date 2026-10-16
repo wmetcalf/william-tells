@@ -63,11 +63,13 @@ enum WTQRKWorker {
                 + "http_agent for TLS/mTLS, or put a TLS proxy in front and bind loopback")
         }
         let loopback = ["127.0.0.1", "localhost", "::1"].contains(bind)
-        // A /0 network admits every address, so it gates nothing.
-        let gated = token != nil || (!cidrs.isEmpty && !cidrs.contains { $0.bits == 0 })
+        // An allowlist that admits every address gates nothing: a /0, or narrower entries whose
+        // union covers a whole address family (0.0.0.0/1 + 128.0.0.0/1).
+        let gated = token != nil || (!cidrs.isEmpty && !admitsEveryAddress(cidrs))
         if !loopback && !gated && e["BLASTBOX_WORKER_AGENT_ALLOW_INSECURE"] != "1" {
-            throw WorkerError("refusing to serve \(bind):\(port) with no token and no narrower "
-                + "BLASTBOX_WORKER_AGENT_ALLOW_CIDRS than /0: anyone who reaches the port could submit jobs")
+            throw WorkerError("refusing to serve \(bind):\(port) with no token and no "
+                + "BLASTBOX_WORKER_AGENT_ALLOW_CIDRS narrower than every address: anyone who reaches "
+                + "the port could submit jobs")
         }
 
         let scannerPath = e["WTQRK_SCAN_BIN"].flatMap { $0.isEmpty ? nil : $0 }
@@ -337,6 +339,51 @@ struct CIDR: Sendable {
         if inet_pton(AF_INET6, s, &v6) == 1 { return withUnsafeBytes(of: &v6) { Array($0) } }
         return nil
     }
+}
+
+extension CIDR {
+    /// The network's first and last address, big-endian.
+    var span: (lo: [UInt8], hi: [UInt8]) {
+        var lo = net, hi = net
+        for i in 0..<net.count {
+            let take = min(8, max(0, bits - i * 8))
+            let mask = take == 0 ? UInt8(0) : UInt8(truncatingIfNeeded: 0xFF << (8 - take))
+            lo[i] = net[i] & mask
+            hi[i] = net[i] | ~mask
+        }
+        return (lo, hi)
+    }
+}
+
+/// Whether `cidrs` together admit every address in `lo...hi` (both the same width).
+func covers(_ cidrs: [CIDR], lo: [UInt8], hi: [UInt8]) -> Bool {
+    let below = { (a: [UInt8], b: [UInt8]) in a.lexicographicallyPrecedes(b) }
+    let spans = cidrs.filter { $0.net.count == lo.count }.compactMap { c -> ([UInt8], [UInt8])? in
+        let (s, e) = c.span
+        let start = below(s, lo) ? lo : s, end = below(hi, e) ? hi : e
+        return below(end, start) ? nil : (start, end)
+    }.sorted { below($0.0, $1.0) }
+    var next = lo                       // the lowest address not yet shown to be covered
+    for (start, end) in spans {
+        if below(next, start) { return false }          // a gap no later span can fill
+        if below(end, next) { continue }
+        if end == hi { return true }
+        next = end                      // end < hi, so end + 1 cannot overflow
+        var i = next.count - 1
+        while next[i] == 0xFF { next[i] = 0; i -= 1 }
+        next[i] += 1
+    }
+    return false
+}
+
+/// Whether the allowlist admits every peer of some address family: all of IPv4, all of IPv6, or
+/// every IPv4-mapped IPv6 address (how IPv4 peers can appear on a dual-stack bind). Checked for
+/// every family, not just the bind's, so an allowlist can't gate one spelling and open another.
+func admitsEveryAddress(_ cidrs: [CIDR]) -> Bool {
+    let mapped = [UInt8](repeating: 0, count: 10) + [0xFF, 0xFF]
+    return covers(cidrs, lo: [UInt8](repeating: 0, count: 4), hi: [UInt8](repeating: 0xFF, count: 4))
+        || covers(cidrs, lo: [UInt8](repeating: 0, count: 16), hi: [UInt8](repeating: 0xFF, count: 16))
+        || covers(cidrs, lo: mapped + [0, 0, 0, 0], hi: mapped + [0xFF, 0xFF, 0xFF, 0xFF])
 }
 
 func parseCIDRs(_ raw: String) throws -> [CIDR] {

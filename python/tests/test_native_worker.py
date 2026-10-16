@@ -222,16 +222,51 @@ def test_rejected_uploads_are_not_buffered(agent):
     assert peak - before < 32 << 10, f"worker grew {peak - before} KB on a rejected upload"
 
 
-def test_a_catch_all_allowlist_is_not_a_gate(tmp_path):
-    # 0.0.0.0/0 admits everyone: with no token, a non-loopback bind is refused at startup.
-    for cidrs in ("0.0.0.0/0", "10.0.0.0/8,::/0"):
-        env = {"HOME": os.environ["HOME"], "PATH": "/usr/bin:/bin",
-               "WTQRK_SLOT_ROOT": str(tmp_path / "slots"), "WTQRK_WORKER_SLOT": "953",
-               "BLASTBOX_WORKER_AGENT_BIND": "0.0.0.0", "BLASTBOX_WORKER_AGENT_PORT": str(_free_port()),
-               "BLASTBOX_WORKER_AGENT_ALLOW_CIDRS": cidrs}
-        r = subprocess.run([str(WORKER)], env=env, capture_output=True, timeout=60)
-        assert r.returncode == 78, r
-        assert b"refusing to serve" in r.stdout + r.stderr
+def _gate_env(tmp_path, cidrs):
+    return {"HOME": os.environ["HOME"], "PATH": "/usr/bin:/bin",
+            "WTQRK_SLOT_ROOT": str(tmp_path / "slots"), "WTQRK_WORKER_SLOT": "953",
+            "BLASTBOX_WORKER_AGENT_BIND": "0.0.0.0", "BLASTBOX_WORKER_AGENT_PORT": str(_free_port()),
+            "BLASTBOX_WORKER_AGENT_ALLOW_CIDRS": cidrs}
+
+
+@pytest.mark.parametrize("cidrs", [
+    "0.0.0.0/0",
+    "10.0.0.0/8,::/0",
+    # no entry is /0, but together they admit every address of a family
+    "0.0.0.0/1,128.0.0.0/1",
+    "0.0.0.0/2,64.0.0.0/2,128.0.0.0/1",
+    "128.0.0.0/2,10.0.0.0/8,0.0.0.0/1,100.0.0.0/8,192.0.0.0/2",     # overlapping, unsorted
+    "0.0.0.1/1,255.255.255.255/1",                                  # host bits set
+    "::/1,8000::/1",
+    "::ffff:0.0.0.0/97,::ffff:128.0.0.0/97",                        # every IPv4-mapped peer
+])
+def test_a_catch_all_allowlist_is_not_a_gate(tmp_path, cidrs):
+    # An allowlist admitting everyone gates nothing: with no token, a non-loopback bind is refused.
+    r = subprocess.run([str(WORKER)], env=_gate_env(tmp_path, cidrs), capture_output=True, timeout=60)
+    assert r.returncode == 78, r
+    assert b"refusing to serve" in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("cidrs", [
+    "10.0.0.0/8",
+    "0.0.0.0/1,128.0.0.0/2,192.0.0.0/3,224.0.0.0/4,240.0.0.0/5,248.0.0.0/6,252.0.0.0/7,"
+    "254.0.0.0/8,255.0.0.0/9,255.128.0.0/10,255.192.0.0/11,255.224.0.0/12,255.240.0.0/13,"
+    "255.248.0.0/14,255.252.0.0/15,255.254.0.0/16,255.255.0.0/17,255.255.128.0/18,"
+    "255.255.192.0/19,255.255.224.0/20,255.255.240.0/21,255.255.248.0/22,255.255.252.0/23,"
+    "255.255.254.0/24,255.255.255.0/25,255.255.255.128/26,255.255.255.192/27,"
+    "255.255.255.224/28,255.255.255.240/29,255.255.255.248/30,255.255.255.252/31,"
+    "255.255.255.254/32",                       # every IPv4 address but 255.255.255.255
+    "0.0.0.0/1,::ffff:128.0.0.0/97",            # halves of different families don't add up
+])
+def test_an_allowlist_that_leaves_addresses_out_is_a_gate(tmp_path, cidrs):
+    proc = subprocess.Popen([str(WORKER)], env=_gate_env(tmp_path, cidrs),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        out, _ = proc.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _ = proc.communicate()
+    assert b"refusing to serve" not in out, out
 
 
 def test_a_trickled_upload_cannot_hold_the_worker(tmp_path):
