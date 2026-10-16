@@ -353,6 +353,11 @@ struct CIDR: Sendable {
     let net: [UInt8]
     let bits: Int
 
+    init(net: [UInt8], bits: Int) {
+        self.net = net
+        self.bits = bits
+    }
+
     init?(_ s: String) {
         let parts = s.trimmingCharacters(in: .whitespaces).split(separator: "/", maxSplits: 1)
         guard let addr = CIDR.bytes(String(parts[0])) else { return nil }
@@ -363,8 +368,35 @@ struct CIDR: Sendable {
         bits = b
     }
 
+    /// An IPv4 peer and its IPv4-mapped IPv6 spelling (`::ffff:a.b.c.d`, how a dual-stack bind
+    /// reports IPv4 clients) are the same peer: it matches a network of either family. Only the
+    /// mapped prefix counts -- not the deprecated IPv4-compatible `::a.b.c.d` or NAT64 64:ff9b::/96.
     func contains(_ ip: String) -> Bool {
-        guard let a = CIDR.bytes(ip), a.count == net.count else { return false }
+        guard let a = CIDR.bytes(ip) else { return false }
+        return CIDR.forms(a).contains { $0.count == net.count && matches($0) }
+    }
+
+    static let mappedPrefix = [UInt8](repeating: 0, count: 10) + [0xFF, 0xFF]
+
+    /// `a` in every family it can arrive as: itself, plus its other spelling when it is IPv4 or
+    /// IPv4-mapped IPv6.
+    static func forms(_ a: [UInt8]) -> [[UInt8]] {
+        if a.count == 4 { return [a, mappedPrefix + a] }
+        if a.count == 16 && Array(a[0..<12]) == mappedPrefix { return [a, Array(a[12..<16])] }
+        return [a]
+    }
+
+    /// The same network in the other family, when it has one: an IPv4 network as its mapped
+    /// IPv6 range, and a network inside ::ffff:0:0/96 as the IPv4 addresses it maps.
+    var otherFamily: CIDR? {
+        if net.count == 4 { return CIDR(net: CIDR.mappedPrefix + net, bits: bits + 96) }
+        if net.count == 16 && bits >= 96 && Array(span.lo[0..<12]) == CIDR.mappedPrefix {
+            return CIDR(net: Array(net[12..<16]), bits: bits - 96)
+        }
+        return nil
+    }
+
+    private func matches(_ a: [UInt8]) -> Bool {
         for i in 0..<net.count {
             let take = min(8, max(0, bits - i * 8))
             if take == 0 { break }
@@ -420,8 +452,12 @@ func covers(_ cidrs: [CIDR], lo: [UInt8], hi: [UInt8]) -> Bool {
 /// Whether the allowlist admits every peer of some address family: all of IPv4, all of IPv6, or
 /// every IPv4-mapped IPv6 address (how IPv4 peers can appear on a dual-stack bind). Checked for
 /// every family, not just the bind's, so an allowlist can't gate one spelling and open another.
-func admitsEveryAddress(_ cidrs: [CIDR]) -> Bool {
-    let mapped = [UInt8](repeating: 0, count: 10) + [0xFF, 0xFF]
+/// Matching treats an IPv4 peer and its mapped spelling as one (`CIDR.contains`), so coverage
+/// does too: each network also counts in its other family, so IPv4 halves listed in different
+/// spellings still add up to every IPv4 peer.
+func admitsEveryAddress(_ given: [CIDR]) -> Bool {
+    let cidrs = given + given.compactMap(\.otherFamily)
+    let mapped = CIDR.mappedPrefix
     return covers(cidrs, lo: [UInt8](repeating: 0, count: 4), hi: [UInt8](repeating: 0xFF, count: 4))
         || covers(cidrs, lo: [UInt8](repeating: 0, count: 16), hi: [UInt8](repeating: 0xFF, count: 16))
         || covers(cidrs, lo: mapped + [0, 0, 0, 0], hi: mapped + [0xFF, 0xFF, 0xFF, 0xFF])

@@ -239,6 +239,8 @@ def _gate_env(tmp_path, cidrs):
     "0.0.0.1/1,255.255.255.255/1",                                  # host bits set
     "::/1,8000::/1",
     "::ffff:0.0.0.0/97,::ffff:128.0.0.0/97",                        # every IPv4-mapped peer
+    # an IPv4 peer matches either spelling, so halves in different families add up
+    "0.0.0.0/1,::ffff:128.0.0.0/97",
 ])
 def test_a_catch_all_allowlist_is_not_a_gate(tmp_path, cidrs):
     # An allowlist admitting everyone gates nothing: with no token, a non-loopback bind is refused.
@@ -256,7 +258,8 @@ def test_a_catch_all_allowlist_is_not_a_gate(tmp_path, cidrs):
     "255.255.254.0/24,255.255.255.0/25,255.255.255.128/26,255.255.255.192/27,"
     "255.255.255.224/28,255.255.255.240/29,255.255.255.248/30,255.255.255.252/31,"
     "255.255.255.254/32",                       # every IPv4 address but 255.255.255.255
-    "0.0.0.0/1,::ffff:128.0.0.0/97",            # halves of different families don't add up
+    "0.0.0.0/1,::ffff:128.0.0.0/98",            # one quarter of IPv4 still missing
+    "::0.0.0.0/97,::0.128.0.0/97,0.0.0.0/1",    # IPv4-compatible (::a.b.c.d) is not mapped
 ])
 def test_an_allowlist_that_leaves_addresses_out_is_a_gate(tmp_path, cidrs):
     proc = subprocess.Popen([str(WORKER)], env=_gate_env(tmp_path, cidrs),
@@ -353,5 +356,30 @@ def test_a_declared_over_limit_upload_is_closed(tmp_path):
                        f"Content-Length: {50 << 20}\r\n\r\n").encode() + b"\0" * 1024)
             reply = _until_closed(s, 5)
         assert reply.split(b"\r\n", 1)[0].split()[1] == b"413", reply[:200]
+    finally:
+        a.stop()
+
+
+@pytest.mark.parametrize("cidrs,admitted", [
+    ("127.0.0.1/32", True),                     # an IPv4 entry admits the mapped peer
+    ("127.0.0.0/8,10.0.0.0/8", True),
+    ("::ffff:127.0.0.1/128", True),             # and so does its mapped spelling
+    ("::ffff:127.0.0.0/104", True),
+    ("10.0.0.0/8", False),
+    ("::127.0.0.1/128", False),                 # IPv4-compatible is a different address
+    ("64:ff9b::127.0.0.1/128", False),          # so is NAT64
+])
+def test_a_dual_stack_bind_matches_ipv4_peers_in_either_spelling(tmp_path, cidrs, admitted):
+    # Bound to ::, an IPv4 client arrives as ::ffff:127.0.0.1. The documented IPv4 allowlist must
+    # still admit it, or the worker answers 403 to its own dispatcher.
+    a = Agent(tmp_path, 955, env={"BLASTBOX_WORKER_AGENT_BIND": "::",
+                                  "BLASTBOX_WORKER_AGENT_ALLOW_CIDRS": cidrs})
+    try:
+        try:
+            a.health()
+            code = 200
+        except urllib.error.HTTPError as e:
+            code = e.code
+        assert (code != 403) is admitted, code
     finally:
         a.stop()
