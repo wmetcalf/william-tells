@@ -11,6 +11,10 @@ import Vapor
 ///   behaviour. Faster, and only for images you trust.
 protocol ScanBackend: Sendable {
     var name: String { get }
+    /// How many scans can run at once: the job queue starts exactly this many workers, so every
+    /// sandbox slot (or pooled engine) can be in use. Derived from what was actually provisioned,
+    /// never configured separately, so the two can't drift.
+    var capacity: Int { get }
     func scan(imageData: Data, config: MutationConfig, earlyExit: Bool) async throws -> ScanReport
     /// Whether a scan can succeed right now (`GET /health`).
     func readiness() async -> (ready: Bool, detail: String)
@@ -19,6 +23,7 @@ protocol ScanBackend: Sendable {
 struct InProcessBackend: ScanBackend {
     let pool: ScannerPool
     var name: String { "inprocess (unsandboxed)" }
+    var capacity: Int { pool.size }
 
     func readiness() async -> (ready: Bool, detail: String) { (true, "inprocess") }
 
@@ -38,6 +43,7 @@ struct InProcessBackend: ScanBackend {
 struct SandboxedBackend: ScanBackend {
     let scanner: SandboxedScanner
     var name: String { "sandbox (App Sandbox, one process per image)" }
+    var capacity: Int { scanner.slots.count }
 
     func readiness() async -> (ready: Bool, detail: String) {
         let gate = await scanner.selfTest()

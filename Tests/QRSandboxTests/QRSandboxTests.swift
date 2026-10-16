@@ -105,6 +105,8 @@ struct SandboxedScannerTests {
         defer { try? FileManager.default.removeItem(at: root) }
         // A test-only identifier range so tests never touch a real worker's slot containers.
         let scanner = try SandboxedScanner(scanner: scannerBinary()!, slotIndices: [900, 901], root: root)
+        // The web service runs one queue worker per provisioned slot (ScanBackend.capacity).
+        #expect(scanner.slots.count == 2)
         let gate = await scanner.selfTest()
         #expect(gate.ok, "\(gate.detail)")
 

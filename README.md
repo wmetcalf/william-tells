@@ -181,16 +181,18 @@ Default config covers brightness extremes and contrast adjustments that catch mo
 ```
 HTTP requests ──> Vapor (async) ──> Job Queue (FIFO)
                                         │
-                                   Scanner Pool (8 engines)
+                         Scan backend (WTQRK_SANDBOX_SLOTS, default 4)
                                    ┌────┬────┬────┬───┐
-                                   │ E1 │ E2 │ .. │ E8│
+                                   │ S1 │ S2 │ .. │ Sn│
                                    └────┴────┴────┴───┘
                                         │
                               Metal GPU + Neural Engine
 ```
 
-- **8 QRScannerEngine instances** in a pool, each with its own Metal-backed CIContext
-- **8 worker tasks** pull jobs from an AsyncStream FIFO queue
+- **`WTQRK_SANDBOX_SLOTS` scan slots** (default 4, max 32): App Sandbox slots, or with
+  `WTQRK_SCAN_BACKEND=inprocess` that many QRScannerEngine instances, each with its own
+  Metal-backed CIContext
+- **One worker task per slot** pulls jobs from an AsyncStream FIFO queue, so every slot is used
 - **Semaphore-style checkout/checkin** — when all engines are busy, jobs wait in queue
 - **Bounded queue** — rejects with 429 when the queue exceeds `WTQRK_MAX_QUEUE` (default 100)
 - Input validation (bad base64, config limits, batch size) returns 400 immediately before queueing
@@ -245,7 +247,7 @@ Terraform handles the build, launchd service install, and health check automatic
 | `WTQRK_PASS` | _(none)_ | Basic auth password |
 | `WTQRK_MAX_QUEUE` | `100` | Max pending jobs before 429 rejection |
 | `WTQRK_SCAN_BACKEND` | `sandbox` | `sandbox`: one App-Sandboxed process per image. `inprocess`: decode inside the server (trusted images only) |
-| `WTQRK_SANDBOX_SLOTS` | `4` | Concurrent sandboxed scans |
+| `WTQRK_SANDBOX_SLOTS` | `4` | Concurrent scans (1–32): sandbox slots, or in-process engines; the job queue runs one worker per slot |
 | `WTQRK_SCAN_BIN` | next to `App` | The `wtqrk-scan` binary to sandbox |
 | `WTQRK_SLOT_ROOT` | `~/Library/Application Support/wtqrk/slots` | Where slots (signed scanner copies) live |
 

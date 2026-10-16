@@ -7,7 +7,9 @@ import QRScanCore
 func routes(_ app: Application, backend: ScanBackend) throws {
     let jobStore = JobStore()
     let maxPending = Int(Environment.get("WTQRK_MAX_QUEUE") ?? "100") ?? 100
-    let jobQueue = JobQueue(store: jobStore, backend: backend, maxPending: maxPending)
+    // One worker per scan the backend can run at once (WTQRK_SANDBOX_SLOTS): no slot sits idle.
+    let jobQueue = JobQueue(store: jobStore, backend: backend, workerCount: backend.capacity,
+                            maxPending: maxPending)
 
     // Upload form UI
     app.get { req -> Response in

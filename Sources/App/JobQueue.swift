@@ -92,10 +92,12 @@ actor JobStore {
 // MARK: - Scanner Pool
 
 actor ScannerPool {
+    nonisolated let size: Int
     private var available: [QRScannerEngine]
     private var waiters: [CheckedContinuation<QRScannerEngine, Never>] = []
 
     init(size: Int) {
+        self.size = size
         self.available = (0..<size).map { _ in QRScannerEngine() }
     }
 
@@ -142,7 +144,7 @@ actor JobQueue {
     private var pendingCount: Int = 0
     private let maxPending: Int
 
-    init(store: JobStore, backend: ScanBackend, workerCount: Int = 8, maxPending: Int = 100) {
+    init(store: JobStore, backend: ScanBackend, workerCount: Int, maxPending: Int = 100) {
         self.store = store
         self.backend = backend
         self.maxPending = maxPending
