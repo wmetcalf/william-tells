@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Embedded into the wtqrk-scan binary (__TEXT,__info_plist). Vision needs a main-bundle id to
+  build its Neural Engine inference plan; a bare executable without one fails with
+  "Null bundleID" and returns no detections instead of an error.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>io.github.wmetcalf.wtqrk-scan</string>
+  <key>CFBundleName</key>
+  <string>wtqrk-scan</string>
+  <key>CFBundleExecutable</key>
+  <string>wtqrk-scan</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+</dict>
+</plist>

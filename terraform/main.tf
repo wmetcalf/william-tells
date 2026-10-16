@@ -242,8 +242,11 @@ resource "terraform_data" "provision" {
   triggers_replace = [
     aws_instance.mac.id,
     filemd5("${path.module}/../Package.swift"),
-    md5(join("", [for f in fileset("${path.module}/../Sources", "**/*.swift") : filemd5("${path.module}/../Sources/${f}")])),
+    # every build input, not just *.swift: wtqrk-scan links its Info.plist (Vision needs it)
+    md5(join("", [for f in fileset("${path.module}/../Sources", "**") : filemd5("${path.module}/../Sources/${f}")])),
     filemd5("${path.module}/../openapi.yaml"),
+    filemd5("${path.module}/files/com.wtqrk.qrscanner.plist.tftpl"),
+    filemd5("${path.module}/files/com.wtqrk.qrscanner-bootstrap.plist"),
     var.wtqrk_user,
     var.wtqrk_pass,
   ]
@@ -256,9 +259,25 @@ resource "terraform_data" "provision" {
     timeout     = "15m"
   }
 
+  # The file provisioner copies over what's there and never deletes: clear the uploaded trees
+  # first, so a file removed from the repo can't stay on the instance and get compiled. (.build
+  # is kept for incremental builds.)
+  provisioner "remote-exec" {
+    inline = [
+      "mkdir -p /Users/ec2-user/qr-scanner",
+      "rm -rf /Users/ec2-user/qr-scanner/Sources /Users/ec2-user/qr-scanner/Tests /Users/ec2-user/qr-scanner/Package.swift",
+    ]
+  }
+
   provisioner "file" {
     source      = "${path.module}/../Sources"
     destination = "/Users/ec2-user/qr-scanner/Sources"
+  }
+
+  # Package.swift declares the test targets' paths; SwiftPM rejects the manifest if they're missing.
+  provisioner "file" {
+    source      = "${path.module}/../Tests"
+    destination = "/Users/ec2-user/qr-scanner/Tests"
   }
 
   provisioner "file" {
@@ -276,18 +295,33 @@ resource "terraform_data" "provision" {
     destination = "/Users/ec2-user/qr-scanner/openapi.yaml"
   }
 
+  provisioner "file" {
+    content = templatefile("${path.module}/files/com.wtqrk.qrscanner.plist.tftpl", {
+      app_port = var.app_port, wtqrk_user = var.wtqrk_user, wtqrk_pass = var.wtqrk_pass
+    })
+    destination = "/tmp/com.wtqrk.qrscanner.plist"
+  }
+
+  provisioner "file" {
+    source      = "${path.module}/files/com.wtqrk.qrscanner-bootstrap.plist"
+    destination = "/tmp/com.wtqrk.qrscanner-bootstrap.plist"
+  }
+
   provisioner "remote-exec" {
     inline = [
       "sleep 30",
       "xcode-select -p || (xcode-select --install && sleep 120) || true",
-      "mkdir -p /Users/ec2-user/qr-scanner/Tests/AppTests",
       "cd /Users/ec2-user/qr-scanner && swift build -c release 2>&1",
-      "sudo mkdir -p /var/log/wtqrk",
-      "sudo tee /Library/LaunchDaemons/com.wtqrk.qrscanner.plist > /dev/null <<'PLIST'\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>com.wtqrk.qrscanner</string>\n  <key>ProgramArguments</key><array><string>/Users/ec2-user/qr-scanner/.build/release/App</string><string>--env</string><string>production</string></array>\n  <key>WorkingDirectory</key><string>/Users/ec2-user/qr-scanner</string>\n  <key>EnvironmentVariables</key><dict>\n    <key>PORT</key><string>${var.app_port}</string>\n    <key>WTQRK_USER</key><string>${var.wtqrk_user}</string>\n    <key>WTQRK_PASS</key><string>${var.wtqrk_pass}</string>\n  </dict>\n  <key>KeepAlive</key><true/>\n  <key>RunAtLoad</key><true/>\n  <key>ThrottleInterval</key><integer>10</integer>\n  <key>StandardOutPath</key><string>/var/log/wtqrk/stdout.log</string>\n  <key>StandardErrorPath</key><string>/var/log/wtqrk/stderr.log</string>\n</dict>\n</plist>\nPLIST",
-      "sudo launchctl unload /Library/LaunchDaemons/com.wtqrk.qrscanner.plist 2>/dev/null || true",
-      "sudo launchctl load /Library/LaunchDaemons/com.wtqrk.qrscanner.plist",
-      "sleep 5",
-      "curl -s http://localhost:${var.app_port}/health || echo 'Service not yet responding'",
+      "sudo mkdir -p /var/log/wtqrk && sudo chown -R ec2-user /var/log/wtqrk",  # -R: the old root daemon left root-owned logs here
+      # Earlier deploys ran the app as a root LaunchDaemon, where App Sandbox can't start the scanner.
+      "sudo launchctl bootout system/com.wtqrk.qrscanner 2>/dev/null || true",
+      "sudo rm -f /Library/LaunchDaemons/com.wtqrk.qrscanner.plist",
+      "mkdir -p /Users/ec2-user/Library/LaunchAgents && mv /tmp/com.wtqrk.qrscanner.plist /Users/ec2-user/Library/LaunchAgents/",
+      "sudo install -o root -g wheel -m 644 /tmp/com.wtqrk.qrscanner-bootstrap.plist /Library/LaunchDaemons/",
+      "sudo launchctl bootout user/$(id -u)/com.wtqrk.qrscanner 2>/dev/null || true",
+      "sudo launchctl bootstrap user/$(id -u) /Users/ec2-user/Library/LaunchAgents/com.wtqrk.qrscanner.plist",
+      # The sandbox self-test (a real Vision scan) runs before /health is ready.
+      "for i in $(seq 1 60); do curl -sf http://localhost:${var.app_port}/health && exit 0; sleep 2; done; echo 'Service not ready:'; curl -s http://localhost:${var.app_port}/health; tail -20 /var/log/wtqrk/stderr.log; exit 1",
     ]
   }
 }

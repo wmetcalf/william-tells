@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>William Tells QR Killer</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+
+<div class="header">
+  <img src="/assets/logo.png" alt="William Tells QR Killer">
+  <h1>William Tells QR Killer</h1>
+  <p class="subtitle">Apple Vision QR decoder &middot; one sandboxed scan per image, via blastbox</p>
+</div>
+
+<div class="drop-zone" id="dropZone">
+  <p>Drop images here or click to select</p>
+  <p class="formats">PNG, JPEG, HEIC, WebP, TIFF, GIF, BMP</p>
+  <input type="file" id="fileInput" multiple accept="image/*,.heic,.heif,.webp" hidden>
+</div>
+
+<div class="file-list" id="fileList"></div>
+
+<div class="controls">
+  <div class="mode-toggle">
+    <label><input type="radio" name="mode" value="default" checked><span>Scan</span></label>
+    <label><input type="radio" name="mode" value="heavy"><span>Heavy</span></label>
+  </div>
+  <button class="scan" id="scanBtn" disabled>Scan</button>
+  <span class="spinner" id="spinner">&#9881;</span>
+  <span id="status" style="font-size:0.8rem;color:#8a7d65;"></span>
+</div>
+
+<div class="results" id="results"></div>
+
+<script src="/assets/app.js"></script>
+</body>
+</html>

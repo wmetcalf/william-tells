@@ -1,13 +1,15 @@
 import Vapor
 import Foundation
+import QRScanCore
 
 // MARK: - Routes
 
-func routes(_ app: Application) throws {
+func routes(_ app: Application, backend: ScanBackend) throws {
     let jobStore = JobStore()
-    let scannerPool = ScannerPool(size: 8)
     let maxPending = Int(Environment.get("WTQRK_MAX_QUEUE") ?? "100") ?? 100
-    let jobQueue = JobQueue(store: jobStore, pool: scannerPool, maxPending: maxPending)
+    // One worker per scan the backend can run at once (WTQRK_SANDBOX_SLOTS): no slot sits idle.
+    let jobQueue = JobQueue(store: jobStore, backend: backend, workerCount: backend.capacity,
+                            maxPending: maxPending)
 
     // Upload form UI
     app.get { req -> Response in
@@ -199,8 +201,13 @@ func routes(_ app: Application) throws {
 
     // MARK: - Utility Endpoints
 
-    app.get("health") { req -> String in
-        return "ok"
+    // Readiness, not just liveness: the load balancer health check targets this, so an instance
+    // whose sandbox gate failed (or whose slots were all retired) leaves rotation instead of
+    // failing every job.
+    app.get("health") { req async -> Response in
+        let (ready, detail) = await backend.readiness()
+        return Response(status: ready ? .ok : .serviceUnavailable,
+                        body: .init(string: ready ? "ok" : "not ready: \(detail)"))
     }
 
     app.get("config") { req -> Response in
