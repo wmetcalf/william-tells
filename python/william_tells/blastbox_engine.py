@@ -265,6 +265,28 @@ class WilliamTellsEngine:
                 raise SelfTestFailed(detail)
 
     # ------------------------------------------------------------------
+    def precheck(self, limits: Limits) -> DetonationResult | None:
+        """Refusals that don't depend on the input, made by the blastbox harness BEFORE this
+        engine is handed the file: a bad per-job parameter, a missing scanner, a failed
+        self-test. On macOS the agent accepts a result with no confined run only from here --
+        a refusal from detonate() could have followed an in-process look at the file, so it
+        must come with a sandboxed run. detonate() repeats these checks for a harness that
+        doesn't call precheck()."""
+        detected = Detection(label="unknown", mime="application/octet-stream", confidence=0.0,
+                             source=ENGINE_NAME)
+        if self._self_test_enabled:
+            ok, detail = self.self_test()
+            if not ok:
+                return _error_result(detected, "self_test_failed",
+                                     "scanner failed its known-QR self-test under the sandbox; "
+                                     "no result is trustworthy until `blastbox macos doctor` "
+                                     "passes: " + detail)
+        bad = _bad_params()
+        if bad is not None:
+            return _error_result(detected, *bad, status="rejected")
+        self._require_bin()             # raises: sealed engine_error, input never handed over
+        return None
+
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         with input.open("rb") as fh:
             head = fh.read(1024)
@@ -273,10 +295,7 @@ class WilliamTellsEngine:
                              source=ENGINE_NAME)
 
         def error(code: str, message: str, status: str = "engine_error") -> DetonationResult:
-            return DetonationResult(
-                payload=Record(fields={"schema": SCHEMA, "error": code}),
-                artifacts=[], detected=detected, status=status,  # type: ignore[arg-type]
-                warnings=[Warning(code=code, message=message[:2000])])
+            return _error_result(detected, code, message, status=status)
 
         if self._self_test_enabled:
             ok, detail = self.self_test()
@@ -287,20 +306,17 @@ class WilliamTellsEngine:
                              "no result is trustworthy until `blastbox macos doctor` passes: "
                              + detail)
 
+        bad = _bad_params()
+        if bad is not None:
+            return error(*bad, status="rejected")
         mode = os.environ.get("WTQRK_MODE", "default").strip() or "default"
-        if mode not in ("default", "heavy"):
-            return error("bad_param", f"WTQRK_MODE must be default or heavy, not {mode[:32]!r}",
-                         status="rejected")
         exe = self._require_bin()
         argv = [str(exe), "scan", str(input), "--max-bytes", str(limits.max_input_bytes)]
         if mode == "heavy":
             argv.append("--heavy")
         raw_cfg = os.environ.get("WTQRK_CONFIG", "").strip()
         if raw_cfg:
-            try:
-                argv += ["--config-json", _validate_config(raw_cfg)]
-            except ValueError as exc:
-                return error("bad_config", str(exc), status="rejected")
+            argv += ["--config-json", _validate_config(raw_cfg)]     # checked by _bad_params()
 
         r = self._sb().run(SandboxRequest(
             argv=argv, ro_mounts=[Mount(input, input)], accelerators=ACCELERATORS, limits=limits,
@@ -347,3 +363,26 @@ class WilliamTellsEngine:
         }
         return DetonationResult(payload=Record(fields=fields), artifacts=[], detected=detected,
                                 warnings=warnings)
+
+
+def _error_result(detected: Detection, code: str, message: str,
+                  status: str = "engine_error") -> DetonationResult:
+    return DetonationResult(
+        payload=Record(fields={"schema": SCHEMA, "error": code}),
+        artifacts=[], detected=detected, status=status,  # type: ignore[arg-type]
+        warnings=[Warning(code=code, message=message[:2000])])
+
+
+def _bad_params() -> tuple[str, str] | None:
+    """``(code, message)`` for an invalid per-job parameter (WTQRK_MODE / WTQRK_CONFIG, applied
+    to the env by the agent), or None."""
+    mode = os.environ.get("WTQRK_MODE", "default").strip() or "default"
+    if mode not in ("default", "heavy"):
+        return "bad_param", f"WTQRK_MODE must be default or heavy, not {mode[:32]!r}"
+    raw_cfg = os.environ.get("WTQRK_CONFIG", "").strip()
+    if raw_cfg:
+        try:
+            _validate_config(raw_cfg)
+        except ValueError as exc:
+            return "bad_config", str(exc)
+    return None

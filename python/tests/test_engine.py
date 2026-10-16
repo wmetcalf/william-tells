@@ -353,3 +353,59 @@ def test_a_heif_input_type_is_reported_as_image_heif(tmp_path):
     eng, _ = _engine(tmp_path, _ok_doc([DET], inputType="heif"))
     res = eng.detonate(_input(tmp_path), tmp_path, Limits())
     assert (res.detected.label, res.detected.mime) == ("heif", "image/heif")
+
+
+class TestPrecheck:
+    """blastbox calls precheck(limits) before the engine is handed the input. On macOS it is the
+    only place a refusal is accepted without a confined run, so the input-free refusals live
+    here (detonate() repeats them for a harness that doesn't call precheck)."""
+
+    @pytest.mark.parametrize("mode,cfg,code", [
+        ("turbo", "", "bad_param"), ("default", "{", "bad_config"),
+        ("default", '{"evil": [1]}', "bad_config"),
+    ])
+    def test_bad_params_are_refused_with_their_codes(self, tmp_path, monkeypatch, mode, cfg, code):
+        monkeypatch.setenv("WTQRK_MODE", mode)
+        monkeypatch.setenv("WTQRK_CONFIG", cfg)
+        eng, sb = _engine(tmp_path)
+        res = eng.precheck(Limits())
+        assert res is not None and res.status == "rejected"
+        assert res.payload.fields["error"] == code and res.artifacts == []
+        assert all(r.argv[1] == "self-test" for r in sb.requests)
+
+    def test_good_params_proceed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WTQRK_MODE", "heavy")
+        monkeypatch.delenv("WTQRK_CONFIG", raising=False)
+        eng, _ = _engine(tmp_path)
+        assert eng.precheck(Limits()) is None
+
+    def test_a_missing_scanner_raises_before_the_input(self, tmp_path):
+        eng = WilliamTellsEngine(scan_bin=str(tmp_path / "nope"), sandbox=FakeSandbox(
+            SandboxResult(exit_code=0, stdout=b"", stderr=b"", killed=False)))
+        eng._self_test_enabled = False
+        with pytest.raises(FileNotFoundError):
+            eng.precheck(Limits())
+
+    def test_a_failed_self_test_is_refused_as_an_engine_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(WilliamTellsEngine, "_self_test_ok", None, raising=False)
+        eng, _ = _engine(tmp_path, self_test_ok=False)
+        res = eng.precheck(Limits())
+        assert res is not None and res.status == "engine_error"
+        assert res.payload.fields["error"] == "self_test_failed"
+
+    def test_the_harness_never_hands_a_refused_job_its_input(self, tmp_path, monkeypatch):
+        import json as _json
+
+        from blastbox.worker.harness import run_detonation
+        from blastbox.worker.sandbox.base import confinement_ledger
+        monkeypatch.setenv("WTQRK_MODE", "turbo")
+        eng, sb = _engine(tmp_path)
+        called = []
+        monkeypatch.setattr(eng, "detonate", lambda *a: called.append(a))
+        out = tmp_path / "out"
+        with confinement_ledger() as ledger:
+            assert run_detonation(eng, input_path=_input(tmp_path), output_dir=out,
+                                  limits=Limits()) == 0
+        meta = _json.loads((out / "metadata.json").read_text())
+        assert meta["status"] == "rejected" and called == []
+        assert ledger.rejected_before_parse
