@@ -286,3 +286,72 @@ def test_a_trickled_upload_cannot_hold_the_worker(tmp_path):
             assert b"after-trickle.example" in tar_bytes
     finally:
         a.stop()
+
+
+def _until_closed(s: socket.socket, within: float) -> bytes:
+    """Everything the server sends until it closes the connection; fails if it is still open
+    `within` seconds from now."""
+    s.settimeout(within)
+    got = b""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        try:
+            part = s.recv(65536)
+        except TimeoutError:
+            break
+        except ConnectionResetError:
+            return got
+        if not part:
+            return got
+        got += part
+    raise AssertionError(f"connection still open after {within}s; got {got[:200]!r}")
+
+
+def test_an_over_limit_streamed_upload_is_closed_not_drained(tmp_path):
+    # Chunked, so there is no Content-Length to refuse up front: the cap trips mid-stream. The
+    # client then stalls; the server must answer 413 and close, not wait for the rest while it
+    # holds the buffered megabyte.
+    limit = 1 << 20
+    a = Agent(tmp_path, 955, env={"BLASTBOX_WORKER_AGENT_MAX_BYTES": str(limit)})
+    try:
+        with socket.create_connection(("127.0.0.1", a.port), timeout=30) as s:
+            s.sendall((f"POST /detonate?name=in.png HTTP/1.1\r\nHost: x\r\nX-aws-proxy-auth: {TOKEN}\r\n"
+                       "Transfer-Encoding: chunked\r\n\r\n").encode())
+            chunk = b"\0" * (64 << 10)
+            for _ in range(limit // len(chunk)):
+                s.sendall(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+            s.sendall(b"1\r\n\0\r\n")                      # one byte over the cap, then nothing
+            reply = _until_closed(s, 5)
+        head, _, body = reply.partition(b"\r\n\r\n")
+        assert head.split(b"\r\n", 1)[0].split()[1] == b"413", reply[:200]
+        assert b"too_large" in body
+        # the worker is free again: the connection's end released the single-flight slot
+        tar_bytes = a.detonate(_qr("https://after-overlimit.example/", tmp_path))
+        assert b"after-overlimit.example" in tar_bytes
+    finally:
+        a.stop()
+
+
+def test_a_timed_out_upload_is_closed_not_drained(tmp_path):
+    a = Agent(tmp_path, 956, env={"BLASTBOX_WORKER_AGENT_UPLOAD_TIMEOUT": "2"})
+    try:
+        with socket.create_connection(("127.0.0.1", a.port), timeout=30) as s:
+            s.sendall((f"POST /detonate?name=in.png HTTP/1.1\r\nHost: x\r\nX-aws-proxy-auth: {TOKEN}\r\n"
+                       "Content-Length: 1000000\r\n\r\n").encode() + b"\x89PNG")
+            reply = _until_closed(s, 6)                     # 2 s deadline + slack
+        assert reply.split(b"\r\n", 1)[0].split()[1] == b"408", reply[:200]
+        assert b"upload_timeout" in reply
+    finally:
+        a.stop()
+
+
+def test_a_declared_over_limit_upload_is_closed(tmp_path):
+    a = Agent(tmp_path, 957, env={"BLASTBOX_WORKER_AGENT_MAX_BYTES": str(1 << 20)})
+    try:
+        with socket.create_connection(("127.0.0.1", a.port), timeout=30) as s:
+            s.sendall((f"POST /detonate?name=in.png HTTP/1.1\r\nHost: x\r\nX-aws-proxy-auth: {TOKEN}\r\n"
+                       f"Content-Length: {50 << 20}\r\n\r\n").encode() + b"\0" * 1024)
+            reply = _until_closed(s, 5)
+        assert reply.split(b"\r\n", 1)[0].split()[1] == b"413", reply[:200]
+    finally:
+        a.stop()

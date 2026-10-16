@@ -166,18 +166,19 @@ final class Agent: Sendable {
         guard busy.tryAcquire() else { return Agent.json(.conflict, ["error": "busy"]) }
         defer { busy.release() }
 
+        // An upload refused for its size or its pace ends the connection with the response. Left
+        // open, Vapor keeps reading (and the client keeps sending) the rest of the body for as long
+        // as the client likes, after the upload deadline has stopped mattering.
         if let declared = req.headers.first(name: .contentLength).flatMap(Int.init), declared > maxBytes {
-            return Agent.json(.payloadTooLarge, ["error": "too_large"])
+            return Agent.closing(.payloadTooLarge, ["error": "too_large"])
         }
         let body: Data
         do {
             body = try await receive(req)
         } catch is UploadTimedOut {
-            let r = Agent.json(.requestTimeout, ["error": "upload_timeout"])
-            r.headers.replaceOrAdd(name: .connection, value: "close")
-            return r
+            return Agent.closing(.requestTimeout, ["error": "upload_timeout"])
         } catch {
-            return Agent.json(.payloadTooLarge, ["error": "too_large"])
+            return Agent.closing(.payloadTooLarge, ["error": "too_large"])
         }
         let params = parseParams(req.headers.first(name: "X-Blastbox-Params"))
 
@@ -242,6 +243,25 @@ final class Agent: Sendable {
         headers.contentType = .json
         return Response(status: status, headers: headers, body: .init(data: data))
     }
+
+    /// `json(status, obj)`, after which the server closes the connection. A `Connection: close`
+    /// header can't do it: Vapor takes keep-alive from the REQUEST alone. So the body is a stream
+    /// that sends the whole JSON (Content-Length is exact, the client gets a complete response) and
+    /// then fails; the failed response reaches the pipeline's close-on-error handler, which closes
+    /// the channel and with it the request body still being read.
+    static func closing(_ status: HTTPResponseStatus, _ obj: [String: Any]) -> Response {
+        let data = (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data("{}".utf8)
+        var headers = HTTPHeaders()
+        headers.contentType = .json
+        let sent = SentOnce()
+        return Response(status: status, headers: headers, body: .init(stream: { writer in
+            // Vapor calls this again with an error writer once the stream has failed: send once.
+            guard sent.claim() else { return }
+            writer.write(.buffer(ByteBuffer(bytes: data))).whenComplete { _ in
+                writer.write(.error(CloseConnection()), promise: nil)
+            }
+        }, count: data.count))
+    }
 }
 
 func constantTimeEqual(_ a: [UInt8], _ b: [UInt8]) -> Bool {
@@ -253,6 +273,13 @@ func constantTimeEqual(_ a: [UInt8], _ b: [UInt8]) -> Bool {
 }
 
 struct UploadTimedOut: Error {}
+struct CloseConnection: Error {}
+
+final class SentOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sent = false
+    func claim() -> Bool { lock.withLock { if sent { return false }; sent = true; return true } }
+}
 
 extension Agent {
     /// The request body, capped at maxBytes and at uploadTimeout of wall clock: a client trickling
@@ -262,20 +289,22 @@ extension Agent {
         let loop = req.eventLoop
         let promise = loop.makePromise(of: Data.self)
         let state = UploadState()
+        // A failed upload drops what it buffered at once (`abandon`): the drain callback stays
+        // registered until the connection ends, and it must not hold up to maxBytes until then.
         let timer = loop.scheduleTask(in: uploadTimeout) {
-            if state.finish() { promise.fail(UploadTimedOut()) }
+            if state.abandon() { promise.fail(UploadTimedOut()) }
         }
         let max = maxBytes
         req.body.drain { part in
             switch part {
             case .buffer(var chunk):
                 if !state.append(&chunk, max: max) {
-                    if state.finish() { timer.cancel(); promise.fail(Abort(.payloadTooLarge)) }
+                    if state.abandon() { timer.cancel(); promise.fail(Abort(.payloadTooLarge)) }
                 }
             case .error(let error):
-                if state.finish() { timer.cancel(); promise.fail(error) }
+                if state.abandon() { timer.cancel(); promise.fail(error) }
             case .end:
-                if state.finish() { timer.cancel(); promise.succeed(state.data) }
+                if let data = state.take() { timer.cancel(); promise.succeed(data) }
             }
             return loop.makeSucceededVoidFuture()
         }
@@ -287,7 +316,7 @@ final class UploadState: @unchecked Sendable {
     private let lock = NSLock()
     private var done = false
     private(set) var data = Data()
-    /// False once over max; a no-op after finish().
+    /// False once over max; a no-op once the upload has ended.
     func append(_ chunk: inout ByteBuffer, max: Int) -> Bool {
         lock.withLock {
             if done { return true }
@@ -296,8 +325,20 @@ final class UploadState: @unchecked Sendable {
             return true
         }
     }
-    /// True for exactly one caller.
-    func finish() -> Bool { lock.withLock { if done { return false }; done = true; return true } }
+    /// Ends the upload as failed, releasing the buffer. True for exactly one caller (of either).
+    func abandon() -> Bool {
+        lock.withLock { if done { return false }; done = true; data = Data(); return true }
+    }
+    /// Ends the upload as complete and hands over the buffer. Non-nil for exactly one caller.
+    func take() -> Data? {
+        lock.withLock {
+            if done { return nil }
+            done = true
+            let out = data
+            data = Data()
+            return out
+        }
+    }
 }
 
 final class Busy: @unchecked Sendable {
