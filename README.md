@@ -387,10 +387,18 @@ plain HTTP for a local dispatcher only.
    The ingress's `GET /v1/attestation/key` answers 404 in this stack, because the ingress
    serves it only when it holds the private key. Hand the `attest-key` output to clients
    instead: they pin that key to verify results, e.g. with `blastbox attest verify`.
-5. **Check it.** From the host:
-   `curl --cacert ca.crt --cert dispatcher.crt --key dispatcher.key -H "Authorization: Bearer <token>" https://<mac-ip>:8765/healthz`
-   should return `{"ok": true, "engine": "williamtells"}`. Without the client cert, the TLS
-   handshake fails.
+5. **Check it.** From `deploy/docker` on the host, check each Mac in `BLASTBOX_STATIC_WORKERS`.
+   The certificates come from `WILLIAMTELLS_PKI_DIR`, and `sudo` is needed because
+   `dispatcher.key` is readable only by uid 10001. The token goes in on stdin, so it never shows
+   up in a process listing:
+   ```bash
+   P=$(sed -n 's/^WILLIAMTELLS_PKI_DIR=//p' .env)
+   sed -n 's/^BLASTBOX_STATIC_WORKER_TOKEN=/Authorization: Bearer /p' .env |
+     sudo curl -sS --cacert "$P/ca.crt" --cert "$P/dispatcher.crt" --key "$P/dispatcher.key" \
+       -H @- https://<mac-ip>:8765/healthz
+   ```
+   It should return `{"ok": true, "engine": "williamtells"}`. Without `--cert`/`--key`, the
+   TLS handshake fails (`certificate required`).
 
 **Macs the host can't reach.** The dispatcher opens the connection to the Mac. When the network
 only allows connections out from the Mac (Wi-Fi client isolation, NAT, a one-way firewall between
