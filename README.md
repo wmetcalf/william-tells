@@ -303,6 +303,7 @@ can run on the Mac (Mac-only) or on Linux next to the other engines, with Macs a
 | `python/william_tells/blastbox_ingress.py` + `static/` | Ingress extension: this web UI at `/` and `/jobs/<id>`, on top of the core `/v1/jobs` API. |
 | `deploy/blastbox/williamtells-host.env.example` | Ingress + dispatcher config (one file both source). |
 | `deploy/blastbox/williamtells-worker.env.example` | Mac worker-agent config. |
+| `deploy/docker/` | Linux host stack (ingress + static-pool dispatcher + postgres) for [remote Mac workers](#linux-host--remote-mac-workers). |
 
 ### Install a Mac worker
 
@@ -324,6 +325,78 @@ The ingress and dispatcher run wherever your other blastbox engines do. For a Ma
 deployment, load blastbox's `deploy/macos/io.blastbox.ingress.plist` and
 `io.blastbox.dispatcher.plist` (`pip install -e python/` gives you blastbox), both pointed at your
 copy of `williamtells-host.env.example`.
+
+### Linux host + remote Mac workers
+
+`deploy/docker/` runs the ingress (with this UI) and a static-pool dispatcher on a Linux blastbox
+host, next to the other engines. Nothing on that host decodes an image: every job goes to a Mac
+over https with mutual TLS, and only the Mac's sandbox touches the input.
+
+```
+Loadout ──▶ Linux: blastbox serve ──▶ postgres queue ──▶ blastbox dispatch ══ https + mTLS ══▶ Mac: http_agent ──▶ seatbelt ──▶ wtqrk-scan
+            (docker, :8005)                               (static pool)                       (WilliamTellsEngine)
+```
+
+The Macs run blastbox's Python `http_agent` with `WilliamTellsEngine`, not `wtqrk-worker`: the
+dispatcher's mTLS needs the agent to serve TLS and check client certs, and `wtqrk-worker` speaks
+plain HTTP for a local dispatcher only.
+
+1. **PKI, on the host.** `blastbox pki init` creates the CA and the dispatcher's client cert if
+   you don't have them yet. Give the dispatcher container `ca.crt`, `dispatcher.crt` and
+   `dispatcher.key`, readable by uid 10001; that directory is `WILLIAMTELLS_PKI_DIR`.
+2. **Worker cert, keeping the key on the Mac.** Generate a key and CSR on the Mac, with the
+   address the dispatcher will dial as the subject alt name:
+   ```bash
+   openssl ecparam -name prime256v1 -genkey -noout -out worker.key && chmod 600 worker.key
+   openssl req -new -key worker.key -subj "/CN=<mac-name>" -addext "subjectAltName=IP:<mac-ip>" -out worker.csr
+   ```
+   Copy only `worker.csr` to the host, then sign it with `blastbox pki sign-csr --csr worker.csr --out worker.crt --days 365`.
+   Copy `worker.crt` and `ca.crt` back. The dispatcher checks the SAN, so if the Mac's
+   address changes, issue a new cert. A DHCP reservation, or a tunnel address as described
+   below, avoids that.
+3. **Mac agent.** Install blastbox and `william-tells-blastbox` (`python/`) into a venv, then run
+   `python -I -m blastbox.worker.http_agent` from a per-user LaunchAgent (blastbox's
+   `deploy/macos/io.blastbox.worker-agent.plist`) with:
+   | Variable | Value |
+   |---|---|
+   | `BLASTBOX_ENGINE` | `william_tells.blastbox_engine:WilliamTellsEngine` |
+   | `BLASTBOX_SANDBOX` | `seatbelt` (or `appsandbox`) |
+   | `WTQRK_SCAN_BIN` | `/opt/william-tells/bin/wtqrk-scan` |
+   | `BLASTBOX_WORKER_AGENT_BIND` | the address in the cert's SAN |
+   | `BLASTBOX_WORKER_AGENT_PORT` | `8765` |
+   | `BLASTBOX_WORKER_AGENT_TLS_CERT` / `_TLS_KEY` | `worker.crt` / `worker.key` |
+   | `BLASTBOX_WORKER_AGENT_CLIENT_CA` | `ca.crt`: only the dispatcher's cert gets in |
+   | `BLASTBOX_WORKER_AGENT_ALLOW_CIDRS` | the dispatcher host's source address, as `/32` |
+   | `BLASTBOX_WORKER_AGENT_TOKEN` | a random secret, also set on the dispatcher |
+
+   Its log should show `self-test passed` and `tls=True mtls=True allowlist=True`.
+4. **Host stack.** Copy `deploy/docker/.env.example` to `.env` (0600) and fill in every
+   `REPLACE_ME`. `BLASTBOX_STATIC_WORKERS` is one `https://<mac-ip>:8765` per Mac, and the
+   pool and concurrency sizes equal the number of Macs. Then start it with
+   `docker compose -p williamtells-bb up -d --build`. `BLASTBOX_ATTEST_KEY` is created on the
+   first job. Get its `key_id` and public key for Loadout's `LOADOUT_ATTESTATION_KEYS` with
+   `docker compose -p williamtells-bb exec dispatcher blastbox attest-key --key <data-dir>/attest.key`.
+5. **Check it.** From the host:
+   `curl --cacert ca.crt --cert dispatcher.crt --key dispatcher.key -H "Authorization: Bearer <token>" https://<mac-ip>:8765/healthz`
+   should return `{"ok": true, "engine": "williamtells"}`. Without the client cert, the TLS
+   handshake fails.
+
+**Macs the host can't reach.** The dispatcher opens the connection to the Mac. When the network
+only allows connections out from the Mac (Wi-Fi client isolation, NAT, a one-way firewall between
+subnets), set up a WireGuard tunnel that the Mac dials out on, with `PersistentKeepalive`:
+- Route only the host's tunnel address into the tunnel.
+- Bind the agent to the Mac's tunnel address and allow only the host's tunnel address.
+- Put the Mac's tunnel address in the cert's SAN.
+
+Docker NATs the dispatcher's connections, so the Mac sees them coming from the host's tunnel
+address. On macOS, keep `wg-quick` running from a root LaunchDaemon with `AbandonProcessGroup` set.
+Without it, launchd kills `wireguard-go` when the launching script exits. `wg show` there takes
+the `utunN` name from `/var/run/wireguard/<iface>.name`, not the `wg-quick` name. Give the tunnel
+its own interface and subnet, separate from any blastbox egress overlay.
+
+**No egress on Mac workers.** The scanner never needs the network, and the seatbelt profile
+denies it (`(deny network*)`), even for a job that asks for egress. macOS has no equivalent of
+the Linux worker's egress namespace, so a job's net policy can't be honoured there.
 
 ### Use it
 

@@ -1,0 +1,87 @@
+# William Tells on a Linux blastbox host: ingress (`blastbox serve` + the UI) and a static-pool
+# dispatcher that sends every job to Mac worker agents over https + mTLS. No docker socket and no
+# local engine: decoding only ever happens on the Macs, inside their sandbox.
+#
+#   cp .env.example .env            # fill in every REPLACE_ME
+#   docker compose -p williamtells-bb up -d --build
+#
+# The Macs run blastbox's http_agent with the William Tells engine (seatbelt backend), serving
+# https with a cert this host's CA signed and requiring this dispatcher's client cert. See
+# README.md "Linux host + remote Mac workers".
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: williamtells
+      POSTGRES_USER: williamtells
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U williamtells -d williamtells"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  api:
+    image: williamtells-host:${TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.williamtells-host
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+    env_file: [.env]
+    environment:
+      BLASTBOX_DATABASE_URL: postgresql://williamtells:${POSTGRES_PASSWORD}@postgres:5432/williamtells
+      BLASTBOX_JOB_ROOT: ${WILLIAMTELLS_DATA_DIR:?set WILLIAMTELLS_DATA_DIR in .env}/jobs
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${WILLIAMTELLS_BIND_ADDR:-0.0.0.0}:${WILLIAMTELLS_PORT:-8005}:8000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,size=1g"]
+    volumes:
+      - ${WILLIAMTELLS_DATA_DIR}:${WILLIAMTELLS_DATA_DIR}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/v1/healthz', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 15s
+      start_period: 20s
+      retries: 3
+    networks: [backend, frontend]
+
+  dispatcher:
+    image: williamtells-host:${TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+    env_file: [.env]
+    environment:
+      BLASTBOX_DATABASE_URL: postgresql://williamtells:${POSTGRES_PASSWORD}@postgres:5432/williamtells
+      BLASTBOX_JOB_ROOT: ${WILLIAMTELLS_DATA_DIR}/jobs
+      BLASTBOX_POOL_RUNTIME: static
+      BLASTBOX_ATTEST_KEY: ${WILLIAMTELLS_DATA_DIR}/attest.key
+      # mTLS to the Macs: verify their server certs with this CA, present the dispatcher's cert.
+      BLASTBOX_DISPATCH_TLS_CA: /pki/ca.crt
+      BLASTBOX_DISPATCH_TLS_CERT: /pki/dispatcher.crt
+      BLASTBOX_DISPATCH_TLS_KEY: /pki/dispatcher.key
+    command: ["dispatch"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,size=1g"]
+    volumes:
+      - ${WILLIAMTELLS_DATA_DIR}:${WILLIAMTELLS_DATA_DIR}
+      - ${WILLIAMTELLS_PKI_DIR:?set WILLIAMTELLS_PKI_DIR in .env}:/pki:ro
+    networks: [backend, frontend]   # frontend: outbound to the Macs
+
+networks:
+  backend: {internal: true}
+  frontend: {}
+
+volumes:
+  postgres-data: {}
