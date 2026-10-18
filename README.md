@@ -370,12 +370,19 @@ plain HTTP for a local dispatcher only.
    | `BLASTBOX_WORKER_AGENT_TOKEN` | a random secret, also set on the dispatcher |
 
    Its log should show `self-test passed` and `tls=True mtls=True allowlist=True`.
-4. **Host stack.** Copy `deploy/docker/.env.example` to `.env` (0600) and fill in every
-   `REPLACE_ME`. `BLASTBOX_STATIC_WORKERS` is one `https://<mac-ip>:8765` per Mac, and the
-   pool and concurrency sizes equal the number of Macs. Then start it with
-   `docker compose -p williamtells-bb up -d --build`. `BLASTBOX_ATTEST_KEY` is created on the
-   first job. Get its `key_id` and public key for Loadout's `LOADOUT_ATTESTATION_KEYS` with
+4. **Host stack.** Everything runs from `deploy/docker/`, because Compose only looks for
+   `docker-compose.yml` and `.env` in the current directory and its parents:
+   ```bash
+   cd deploy/docker
+   install -m 600 .env.example .env      # then fill in every REPLACE_ME
+   docker compose -p williamtells-bb up -d --build
+   ```
+   `BLASTBOX_STATIC_WORKERS` is one `https://<mac-ip>:8765` per Mac, and the pool and
+   concurrency sizes equal the number of Macs. `.dockerignore` keeps `.env` (the database
+   password and worker token) out of the build context. `BLASTBOX_ATTEST_KEY` is created on
+   the first job. To get its `key_id` and public key, run
    `docker compose -p williamtells-bb exec dispatcher blastbox attest-key --key <data-dir>/attest.key`.
+   A client pins that key to verify results, e.g. with `blastbox attest verify`.
 5. **Check it.** From the host:
    `curl --cacert ca.crt --cert dispatcher.crt --key dispatcher.key -H "Authorization: Bearer <token>" https://<mac-ip>:8765/healthz`
    should return `{"ok": true, "engine": "williamtells"}`. Without the client cert, the TLS

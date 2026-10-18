@@ -2,8 +2,11 @@
 # dispatcher that sends every job to Mac worker agents over https + mTLS. No docker socket and no
 # local engine: decoding only ever happens on the Macs, inside their sandbox.
 #
-#   cp .env.example .env            # fill in every REPLACE_ME
+#   cd deploy/docker                       # Compose finds this file and .env only from here
+#   install -m 600 .env.example .env       # fill in every REPLACE_ME
 #   docker compose -p williamtells-bb up -d --build
+#
+# .dockerignore excludes the whole directory from the build context, so .env never reaches a builder.
 #
 # The Macs run blastbox's http_agent with the William Tells engine (seatbelt backend), serving
 # https with a cert this host's CA signed and requiring this dispatcher's client cert. See
