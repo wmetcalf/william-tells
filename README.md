@@ -392,8 +392,9 @@ plain HTTP for a local dispatcher only.
    `dispatcher.key` is readable only by uid 10001. The token goes in on stdin, so it never shows
    up in a process listing:
    ```bash
-   P=$(sed -n 's/^WILLIAMTELLS_PKI_DIR=//p' .env)
-   sed -n 's/^BLASTBOX_STATIC_WORKER_TOKEN=/Authorization: Bearer /p' .env |
+   # value only: a trailing " # comment" is dropped, as Compose does
+   P=$(sed -nE 's/^WILLIAMTELLS_PKI_DIR=([^[:space:]]*).*/\1/p' .env)
+   sed -nE 's/^BLASTBOX_STATIC_WORKER_TOKEN=([^[:space:]]*).*/Authorization: Bearer \1/p' .env |
      sudo curl -sS --cacert "$P/ca.crt" --cert "$P/dispatcher.crt" --key "$P/dispatcher.key" \
        -H @- https://<mac-ip>:8765/healthz
    ```
