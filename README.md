@@ -420,18 +420,28 @@ the Linux worker's egress namespace, so a job's net policy can't be honoured the
 
 ### Use it
 
+Every route except `/v1/healthz` and `/v1/version` needs the ingress key (`BLASTBOX_API_KEY`
+in `.env`; Compose refuses to start without it):
+
 ```bash
-curl -F file=@qr.png -F engine=williamtells -F params=WTQRK_MODE=heavy http://HOST:8005/v1/jobs
-curl http://HOST:8005/v1/jobs/<job_id>              # status; result_summary.meta.detection_count
-curl http://HOST:8005/v1/jobs/<job_id>/metadata     # the decoded payloads (payload.fields.payloads)
-curl http://HOST:8005/v1/jobs/<job_id>/attestation  # signed receipt (with BLASTBOX_ATTEST_KEY)
+A="Authorization: Bearer $BLASTBOX_API_KEY"
+curl -H "$A" -F file=@qr.png -F engine=williamtells -F params=WTQRK_MODE=heavy http://HOST:8005/v1/jobs
+curl -H "$A" http://HOST:8005/v1/jobs/<job_id>              # status; result_summary.meta.detection_count
+curl -H "$A" http://HOST:8005/v1/jobs/<job_id>/metadata     # the decoded payloads (payload.fields.payloads)
+curl -H "$A" http://HOST:8005/v1/jobs/<job_id>/attestation  # signed receipt (with BLASTBOX_ATTEST_KEY)
 ```
+
+The ingress speaks plain HTTP, so the key crosses the network in the clear. Bind it to a trusted
+interface (`WILLIAMTELLS_BIND_ADDR`) or put a TLS proxy in front. The browser UI can't send the
+key: reach it through a proxy that authenticates you and adds the header, or set
+`WTQRK_SERVE_UI=0`.
 
 Job params (allowlisted on the dispatcher), each sent as its own `params=KEY=VALUE` field:
 `WTQRK_MODE=default|heavy` (same as `/scan` and `/scan/heavy`) and
 `WTQRK_CONFIG=<mutation config JSON>` (same shape and limits as the API's `config`).
 
-**Loadout.** Loadout talks to the ingress (`LOADOUT_WILLIAMTELLS_URL=http://HOST:8005`), maps its
+**Loadout.** Loadout talks to the ingress (`LOADOUT_WILLIAMTELLS_URL=http://HOST:8005`,
+`LOADOUT_WILLIAMTELLS_API_KEY=<the ingress key>`), maps its
 `mode` setting to `WTQRK_MODE`, and turns each decoded payload into a `url` or `qr_code` artifact.
 
 **Self-test gate.** A job on a Mac whose gate failed is `engine_error` (`self_test_failed`),

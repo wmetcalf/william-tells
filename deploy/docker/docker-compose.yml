@@ -40,6 +40,9 @@ services:
     environment:
       BLASTBOX_DATABASE_URL: postgresql://williamtells:${POSTGRES_PASSWORD}@postgres:5432/williamtells
       BLASTBOX_JOB_ROOT: ${WILLIAMTELLS_DATA_DIR:?set WILLIAMTELLS_DATA_DIR in .env}/jobs
+      # The port is published on every interface by default, so the ingress never starts open:
+      # every route except /v1/healthz and /v1/version needs `Authorization: Bearer <key>`.
+      BLASTBOX_API_KEY: ${BLASTBOX_API_KEY:?set BLASTBOX_API_KEY in .env}
     command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "${WILLIAMTELLS_BIND_ADDR:-0.0.0.0}:${WILLIAMTELLS_PORT:-8005}:8000"
