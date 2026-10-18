@@ -380,9 +380,13 @@ plain HTTP for a local dispatcher only.
    `BLASTBOX_STATIC_WORKERS` is one `https://<mac-ip>:8765` per Mac, and the pool and
    concurrency sizes equal the number of Macs. `.dockerignore` keeps `.env` (the database
    password and worker token) out of the build context. `BLASTBOX_ATTEST_KEY` is created on
-   the first job. To get its `key_id` and public key, run
-   `docker compose -p williamtells-bb exec dispatcher blastbox attest-key --key <data-dir>/attest.key`.
-   A client pins that key to verify results, e.g. with `blastbox attest verify`.
+   the first job, in `WILLIAMTELLS_KEY_DIR`. Only the dispatcher mounts that directory, so a
+   compromised API container can't read or replace the signing key; keep it outside the data
+   dir. To get its `key_id` and public key, run
+   `docker compose -p williamtells-bb exec dispatcher blastbox attest-key --key /keys/attest.key`.
+   The ingress's `GET /v1/attestation/key` answers 404 in this stack, because the ingress
+   serves it only when it holds the private key. Hand the `attest-key` output to clients
+   instead: they pin that key to verify results, e.g. with `blastbox attest verify`.
 5. **Check it.** From the host:
    `curl --cacert ca.crt --cert dispatcher.crt --key dispatcher.key -H "Authorization: Bearer <token>" https://<mac-ip>:8765/healthz`
    should return `{"ok": true, "engine": "williamtells"}`. Without the client cert, the TLS

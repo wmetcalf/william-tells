@@ -67,7 +67,9 @@ services:
       BLASTBOX_DATABASE_URL: postgresql://williamtells:${POSTGRES_PASSWORD}@postgres:5432/williamtells
       BLASTBOX_JOB_ROOT: ${WILLIAMTELLS_DATA_DIR}/jobs
       BLASTBOX_POOL_RUNTIME: static
-      BLASTBOX_ATTEST_KEY: ${WILLIAMTELLS_DATA_DIR}/attest.key
+      # The signing key lives in a directory ONLY this service mounts: the network-facing api
+      # shares the data dir, and must never be able to read (or replace) the key.
+      BLASTBOX_ATTEST_KEY: /keys/attest.key
       # mTLS to the Macs: verify their server certs with this CA, present the dispatcher's cert.
       BLASTBOX_DISPATCH_TLS_CA: /pki/ca.crt
       BLASTBOX_DISPATCH_TLS_CERT: /pki/dispatcher.crt
@@ -80,6 +82,7 @@ services:
     volumes:
       - ${WILLIAMTELLS_DATA_DIR}:${WILLIAMTELLS_DATA_DIR}
       - ${WILLIAMTELLS_PKI_DIR:?set WILLIAMTELLS_PKI_DIR in .env}:/pki:ro
+      - ${WILLIAMTELLS_KEY_DIR:?set WILLIAMTELLS_KEY_DIR in .env}:/keys
     networks: [backend, frontend]   # frontend: outbound to the Macs
 
 networks:
