@@ -421,14 +421,19 @@ the Linux worker's egress namespace, so a job's net policy can't be honoured the
 ### Use it
 
 Every route except `/v1/healthz` and `/v1/version` needs the ingress key (`BLASTBOX_API_KEY`
-in `.env`; Compose refuses to start without it):
+in `.env`; Compose refuses to start without it). Compose reads `.env`, but your shell doesn't,
+so put the header in a private file first. Curl reads the header from the file, which keeps the
+key out of the process list:
 
 ```bash
-A="Authorization: Bearer $BLASTBOX_API_KEY"
-curl -H "$A" -F file=@qr.png -F engine=williamtells -F params=WTQRK_MODE=heavy http://HOST:8005/v1/jobs
-curl -H "$A" http://HOST:8005/v1/jobs/<job_id>              # status; result_summary.meta.detection_count
-curl -H "$A" http://HOST:8005/v1/jobs/<job_id>/metadata     # the decoded payloads (payload.fields.payloads)
-curl -H "$A" http://HOST:8005/v1/jobs/<job_id>/attestation  # signed receipt (with BLASTBOX_ATTEST_KEY)
+H=$(mktemp)    # 0600
+# on the host, from deploy/docker; elsewhere write `Authorization: Bearer <key>` into "$H"
+sed -nE 's/^BLASTBOX_API_KEY=([^[:space:]]*).*/Authorization: Bearer \1/p' .env > "$H"
+curl -H @"$H" -F file=@qr.png -F engine=williamtells -F params=WTQRK_MODE=heavy http://HOST:8005/v1/jobs
+curl -H @"$H" http://HOST:8005/v1/jobs/<job_id>              # status; result_summary.meta.detection_count
+curl -H @"$H" http://HOST:8005/v1/jobs/<job_id>/metadata     # the decoded payloads (payload.fields.payloads)
+curl -H @"$H" http://HOST:8005/v1/jobs/<job_id>/attestation  # signed receipt (with BLASTBOX_ATTEST_KEY)
+rm -f "$H"
 ```
 
 The ingress speaks plain HTTP, so the key crosses the network in the clear. Bind it to a trusted
