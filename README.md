@@ -334,7 +334,7 @@ over https with mutual TLS, and only the Mac's sandbox touches the input.
 
 ```
 Loadout ──▶ Linux: blastbox serve ──▶ postgres queue ──▶ blastbox dispatch ══ https + mTLS ══▶ Mac: http_agent ──▶ seatbelt ──▶ wtqrk-scan
-            (docker, :8005)                               (static pool)                       (WilliamTellsEngine)
+            (docker, https :8005)                         (static pool)                       (WilliamTellsEngine)
 ```
 
 The Macs run blastbox's Python `http_agent` with `WilliamTellsEngine`, not `wtqrk-worker`: the
@@ -344,6 +344,15 @@ plain HTTP for a local dispatcher only.
 1. **PKI, on the host.** `blastbox pki init` creates the CA and the dispatcher's client cert if
    you don't have them yet. Give the dispatcher container `ca.crt`, `dispatcher.crt` and
    `dispatcher.key`, readable by uid 10001; that directory is `WILLIAMTELLS_PKI_DIR`.
+   The ingress serves https only, with its own cert in a separate directory,
+   `WILLIAMTELLS_TLS_DIR` (uid 10001, 0700), so the API container never holds `dispatcher.key`:
+   ```bash
+   openssl ecparam -name prime256v1 -genkey -noout -out ingress.key && chmod 600 ingress.key
+   openssl req -new -key ingress.key -subj "/CN=williamtells-ingress" -addext "subjectAltName=IP:<host-ip>" -out ingress.csr
+   blastbox pki sign-csr --csr ingress.csr --out ingress.crt --days 365
+   ```
+   Put `ingress.crt`, `ingress.key` and a copy of `ca.crt` in that directory. Clients trust
+   `ca.crt`, and the SAN is the address they dial.
 2. **Worker cert, keeping the key on the Mac.** Generate a key and CSR on the Mac, with the
    address the dispatcher will dial as the subject alt name:
    ```bash
@@ -420,33 +429,32 @@ the Linux worker's egress namespace, so a job's net policy can't be honoured the
 
 ### Use it
 
-Every route except `/v1/healthz` and `/v1/version` needs the ingress key (`BLASTBOX_API_KEY`
-in `.env`; Compose refuses to start without it). Compose reads `.env`, but your shell doesn't,
-so put the header in a private file first. Curl reads the header from the file, which keeps the
-key out of the process list:
+The ingress is https only, and every route except `/v1/healthz` and `/v1/version` needs the
+ingress key (`BLASTBOX_API_KEY` in `.env`; Compose refuses to start without it). Compose reads
+`.env`, but your shell doesn't, so put the header in a private file first. Curl reads the header
+from the file, which keeps the key out of the process list:
 
 ```bash
 H=$(mktemp)    # 0600
 # on the host, from deploy/docker; elsewhere write `Authorization: Bearer <key>` into "$H"
 sed -nE 's/^BLASTBOX_API_KEY=([^[:space:]]*).*/Authorization: Bearer \1/p' .env > "$H"
-curl -H @"$H" -F file=@qr.png -F engine=williamtells -F params=WTQRK_MODE=heavy http://HOST:8005/v1/jobs
-curl -H @"$H" http://HOST:8005/v1/jobs/<job_id>              # status; result_summary.meta.detection_count
-curl -H @"$H" http://HOST:8005/v1/jobs/<job_id>/metadata     # the decoded payloads (payload.fields.payloads)
-curl -H @"$H" http://HOST:8005/v1/jobs/<job_id>/attestation  # signed receipt (with BLASTBOX_ATTEST_KEY)
+B="https://HOST:8005"; C=(--cacert ca.crt -H @"$H")
+curl "${C[@]}" -F file=@qr.png -F engine=williamtells -F params=WTQRK_MODE=heavy $B/v1/jobs
+curl "${C[@]}" $B/v1/jobs/<job_id>              # status; result_summary.meta.detection_count
+curl "${C[@]}" $B/v1/jobs/<job_id>/metadata     # the decoded payloads (payload.fields.payloads)
+curl "${C[@]}" $B/v1/jobs/<job_id>/attestation  # signed receipt (with BLASTBOX_ATTEST_KEY)
 rm -f "$H"
 ```
 
-The ingress speaks plain HTTP, so the key crosses the network in the clear. Bind it to a trusted
-interface (`WILLIAMTELLS_BIND_ADDR`) or put a TLS proxy in front. The browser UI can't send the
-key: reach it through a proxy that authenticates you and adds the header, or set
-`WTQRK_SERVE_UI=0`.
+The browser UI can't send the key: reach it through a proxy that authenticates you and adds the
+header, or set `WTQRK_SERVE_UI=0`.
 
 Job params (allowlisted on the dispatcher), each sent as its own `params=KEY=VALUE` field:
 `WTQRK_MODE=default|heavy` (same as `/scan` and `/scan/heavy`) and
 `WTQRK_CONFIG=<mutation config JSON>` (same shape and limits as the API's `config`).
 
-**Loadout.** Loadout talks to the ingress (`LOADOUT_WILLIAMTELLS_URL=http://HOST:8005`,
-`LOADOUT_WILLIAMTELLS_API_KEY=<the ingress key>`), maps its
+**Loadout.** Loadout talks to the ingress (`LOADOUT_WILLIAMTELLS_URL=https://HOST:8005`,
+`LOADOUT_WILLIAMTELLS_CA=<ca.crt>`, `LOADOUT_WILLIAMTELLS_API_KEY=<the ingress key>`), maps its
 `mode` setting to `WTQRK_MODE`, and turns each decoded payload into a `url` or `qr_code` artifact.
 
 **Self-test gate.** A job on a Mac whose gate failed is `engine_error` (`self_test_failed`),

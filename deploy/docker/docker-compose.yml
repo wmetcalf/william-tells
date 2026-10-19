@@ -41,8 +41,11 @@ services:
       BLASTBOX_DATABASE_URL: postgresql://williamtells:${POSTGRES_PASSWORD}@postgres:5432/williamtells
       BLASTBOX_JOB_ROOT: ${WILLIAMTELLS_DATA_DIR:?set WILLIAMTELLS_DATA_DIR in .env}/jobs
       # The port is published on every interface by default, so the ingress never starts open:
-      # every route except /v1/healthz and /v1/version needs `Authorization: Bearer <key>`.
+      # every route except /v1/healthz and /v1/version needs `Authorization: Bearer <key>`,
+      # and the listener is https only, so that key never crosses the network in clear.
       BLASTBOX_API_KEY: ${BLASTBOX_API_KEY:?set BLASTBOX_API_KEY in .env}
+      BLASTBOX_TLS_CERT: /tls/ingress.crt
+      BLASTBOX_TLS_KEY: /tls/ingress.key
     command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "${WILLIAMTELLS_BIND_ADDR:-0.0.0.0}:${WILLIAMTELLS_PORT:-8005}:8000"
@@ -52,8 +55,13 @@ services:
     tmpfs: ["/tmp:rw,nosuid,size=1g"]
     volumes:
       - ${WILLIAMTELLS_DATA_DIR}:${WILLIAMTELLS_DATA_DIR}
+      # ingress.crt, ingress.key and ca.crt only: NOT the PKI dir, whose dispatcher.key this
+      # service must never hold.
+      - ${WILLIAMTELLS_TLS_DIR:?set WILLIAMTELLS_TLS_DIR in .env}:/tls:ro
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/v1/healthz', timeout=5).status==200 else 1)"]
+      # The chain is verified against ca.crt; the name isn't, since the SAN is the host's
+      # address and this dials localhost inside the container.
+      test: ["CMD", "python", "-c", "import ssl,urllib.request,sys; c=ssl.create_default_context(cafile='/tls/ca.crt'); c.check_hostname=False; sys.exit(0 if urllib.request.urlopen('https://localhost:8000/v1/healthz', timeout=5, context=c).status==200 else 1)"]
       interval: 30s
       timeout: 15s
       start_period: 20s
