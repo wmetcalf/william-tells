@@ -436,14 +436,17 @@ from the file, which keeps the key out of the process list:
 
 ```bash
 H=$(mktemp)    # 0600
-# on the host, from deploy/docker; elsewhere write `Authorization: Bearer <key>` into "$H"
+# On the host, from deploy/docker. Elsewhere, write `Authorization: Bearer <key>` into "$H" and
+# set CA to your copy of ca.crt.
 sed -nE 's/^BLASTBOX_API_KEY=([^[:space:]]*).*/Authorization: Bearer \1/p' .env > "$H"
-B="https://HOST:8005"; C=(--cacert ca.crt -H @"$H")
+# ca.crt is public, but its directory is uid 10001's: copy it out
+CA=$(mktemp); sudo cat "$(sed -nE 's/^WILLIAMTELLS_TLS_DIR=([^[:space:]]*).*/\1/p' .env)/ca.crt" > "$CA"
+B="https://HOST:8005"; C=(--cacert "$CA" -H @"$H")
 curl "${C[@]}" -F file=@qr.png -F engine=williamtells -F params=WTQRK_MODE=heavy $B/v1/jobs
 curl "${C[@]}" $B/v1/jobs/<job_id>              # status; result_summary.meta.detection_count
 curl "${C[@]}" $B/v1/jobs/<job_id>/metadata     # the decoded payloads (payload.fields.payloads)
 curl "${C[@]}" $B/v1/jobs/<job_id>/attestation  # signed receipt (with BLASTBOX_ATTEST_KEY)
-rm -f "$H"
+rm -f "$H" "$CA"
 ```
 
 The browser UI can't send the key: reach it through a proxy that authenticates you and adds the
