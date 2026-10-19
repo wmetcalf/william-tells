@@ -1,0 +1,35 @@
+# William Tells ingress + dispatcher (the blastbox HOST side) for a Linux host, next to the other
+# blastbox engines. The engine itself never runs here: the dispatcher hands each job to a Mac worker
+# (static pool) over https + mTLS, and only that Mac decodes the image, inside its sandbox.
+#
+# blastbox and william-tells are pinned to commits so the dispatcher and the Mac's http_agent speak
+# the same protocol. Bump them together with the Mac.
+ARG BASE_IMAGE=python:3.12-slim-bookworm
+FROM ${BASE_IMAGE}
+
+ARG BLASTBOX_REF=eaf03d9b1dc63e694e64b1d3ae4fe01ac51a9cd1
+ARG WILLIAMTELLS_REF=884f80f716bf392e3b7fd2fda13cc59cc15a3f00
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends git ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 williamtells \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin williamtells
+
+RUN python3 -m venv /opt/williamtells \
+    && /opt/williamtells/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/williamtells/bin/pip install --no-cache-dir \
+        "blastbox[host] @ git+https://github.com/wmetcalf/blastbox@${BLASTBOX_REF}" \
+        "william-tells-blastbox @ git+https://github.com/wmetcalf/william-tells@${WILLIAMTELLS_REF}#subdirectory=python" \
+    && /opt/williamtells/bin/python -c "import blastbox.host.ingress.app, william_tells.blastbox_ingress; print('host ok')"
+
+ENV PATH=/opt/williamtells/bin:$PATH \
+    BLASTBOX_ALLOWED_ENGINES=williamtells \
+    BLASTBOX_INGRESS_EXTENSION=william_tells.blastbox_ingress:make_extension
+USER 10001:10001
+WORKDIR /var/lib/williamtells
+ENTRYPOINT ["/usr/bin/tini", "--", "blastbox"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]
+LABEL org.opencontainers.image.title="williamtells-host" \
+      org.opencontainers.image.description="William Tells ingress/dispatcher on blastbox.host (static Mac pool)"

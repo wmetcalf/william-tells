@@ -303,6 +303,7 @@ can run on the Mac (Mac-only) or on Linux next to the other engines, with Macs a
 | `python/william_tells/blastbox_ingress.py` + `static/` | Ingress extension: this web UI at `/` and `/jobs/<id>`, on top of the core `/v1/jobs` API. |
 | `deploy/blastbox/williamtells-host.env.example` | Ingress + dispatcher config (one file both source). |
 | `deploy/blastbox/williamtells-worker.env.example` | Mac worker-agent config. |
+| `deploy/docker/` | Linux host stack (ingress + static-pool dispatcher + postgres) for [remote Mac workers](#linux-host--remote-mac-workers). |
 
 ### Install a Mac worker
 
@@ -325,20 +326,138 @@ deployment, load blastbox's `deploy/macos/io.blastbox.ingress.plist` and
 `io.blastbox.dispatcher.plist` (`pip install -e python/` gives you blastbox), both pointed at your
 copy of `williamtells-host.env.example`.
 
+### Linux host + remote Mac workers
+
+`deploy/docker/` runs the ingress (with this UI) and a static-pool dispatcher on a Linux blastbox
+host, next to the other engines. Nothing on that host decodes an image: every job goes to a Mac
+over https with mutual TLS, and only the Mac's sandbox touches the input.
+
+```
+Loadout ──▶ Linux: blastbox serve ──▶ postgres queue ──▶ blastbox dispatch ══ https + mTLS ══▶ Mac: http_agent ──▶ seatbelt ──▶ wtqrk-scan
+            (docker, https :8005)                         (static pool)                       (WilliamTellsEngine)
+```
+
+The Macs run blastbox's Python `http_agent` with `WilliamTellsEngine`, not `wtqrk-worker`: the
+dispatcher's mTLS needs the agent to serve TLS and check client certs, and `wtqrk-worker` speaks
+plain HTTP for a local dispatcher only.
+
+1. **PKI, on the host.** `blastbox pki init` creates the CA and the dispatcher's client cert if
+   you don't have them yet. Give the dispatcher container `ca.crt`, `dispatcher.crt` and
+   `dispatcher.key`, readable by uid 10001; that directory is `WILLIAMTELLS_PKI_DIR`.
+   The ingress serves https only, with its own cert in a separate directory,
+   `WILLIAMTELLS_TLS_DIR` (uid 10001, 0700), so the API container never holds `dispatcher.key`:
+   ```bash
+   openssl ecparam -name prime256v1 -genkey -noout -out ingress.key && chmod 600 ingress.key
+   openssl req -new -key ingress.key -subj "/CN=williamtells-ingress" -addext "subjectAltName=IP:<host-ip>" -out ingress.csr
+   blastbox pki sign-csr --csr ingress.csr --out ingress.crt --days 365
+   ```
+   Put `ingress.crt`, `ingress.key` and a copy of `ca.crt` in that directory. Clients trust
+   `ca.crt`, and the SAN is the address they dial.
+2. **Worker cert, keeping the key on the Mac.** Generate a key and CSR on the Mac, with the
+   address the dispatcher will dial as the subject alt name:
+   ```bash
+   openssl ecparam -name prime256v1 -genkey -noout -out worker.key && chmod 600 worker.key
+   openssl req -new -key worker.key -subj "/CN=<mac-name>" -addext "subjectAltName=IP:<mac-ip>" -out worker.csr
+   ```
+   Copy only `worker.csr` to the host, then sign it with `blastbox pki sign-csr --csr worker.csr --out worker.crt --days 365`.
+   Copy `worker.crt` and `ca.crt` back. The dispatcher checks the SAN, so if the Mac's
+   address changes, issue a new cert. A DHCP reservation, or a tunnel address as described
+   below, avoids that.
+3. **Mac agent.** Install blastbox and `william-tells-blastbox` (`python/`) into a venv, then run
+   `python -I -m blastbox.worker.http_agent` from a per-user LaunchAgent (blastbox's
+   `deploy/macos/io.blastbox.worker-agent.plist`) with:
+   | Variable | Value |
+   |---|---|
+   | `BLASTBOX_ENGINE` | `william_tells.blastbox_engine:WilliamTellsEngine` |
+   | `BLASTBOX_SANDBOX` | `seatbelt` (or `appsandbox`) |
+   | `WTQRK_SCAN_BIN` | `/opt/william-tells/bin/wtqrk-scan` |
+   | `BLASTBOX_WORKER_AGENT_BIND` | the address in the cert's SAN |
+   | `BLASTBOX_WORKER_AGENT_PORT` | `8765` |
+   | `BLASTBOX_WORKER_AGENT_TLS_CERT` / `_TLS_KEY` | `worker.crt` / `worker.key` |
+   | `BLASTBOX_WORKER_AGENT_CLIENT_CA` | `ca.crt`: only the dispatcher's cert gets in |
+   | `BLASTBOX_WORKER_AGENT_ALLOW_CIDRS` | the dispatcher host's source address, as `/32` |
+   | `BLASTBOX_WORKER_AGENT_TOKEN` | a random secret, also set on the dispatcher |
+
+   Its log should show `self-test passed` and `tls=True mtls=True allowlist=True`.
+4. **Host stack.** Everything runs from `deploy/docker/`, because Compose only looks for
+   `docker-compose.yml` and `.env` in the current directory and its parents:
+   ```bash
+   cd deploy/docker
+   install -m 600 .env.example .env      # then fill in every REPLACE_ME
+   docker compose -p williamtells-bb up -d --build
+   ```
+   `BLASTBOX_STATIC_WORKERS` is one `https://<mac-ip>:8765` per Mac, and the pool and
+   concurrency sizes equal the number of Macs. `.dockerignore` keeps `.env` (the database
+   password and worker token) out of the build context. `BLASTBOX_ATTEST_KEY` is created on
+   the first job, in `WILLIAMTELLS_KEY_DIR`. Only the dispatcher mounts that directory, so a
+   compromised API container can't read or replace the signing key; keep it outside the data
+   dir. To get its `key_id` and public key, run
+   `docker compose -p williamtells-bb exec dispatcher blastbox attest-key --key /keys/attest.key`.
+   The ingress's `GET /v1/attestation/key` answers 404 in this stack, because the ingress
+   serves it only when it holds the private key. Hand the `attest-key` output to clients
+   instead: they pin that key to verify results, e.g. with `blastbox attest verify`.
+5. **Check it.** From `deploy/docker` on the host, check each Mac in `BLASTBOX_STATIC_WORKERS`.
+   The certificates come from `WILLIAMTELLS_PKI_DIR`, and `sudo` is needed because
+   `dispatcher.key` is readable only by uid 10001. The token goes in on stdin, so it never shows
+   up in a process listing:
+   ```bash
+   # value only: a trailing " # comment" is dropped, as Compose does
+   P=$(sed -nE 's/^WILLIAMTELLS_PKI_DIR=([^[:space:]]*).*/\1/p' .env)
+   sed -nE 's/^BLASTBOX_STATIC_WORKER_TOKEN=([^[:space:]]*).*/Authorization: Bearer \1/p' .env |
+     sudo curl -sS --cacert "$P/ca.crt" --cert "$P/dispatcher.crt" --key "$P/dispatcher.key" \
+       -H @- https://<mac-ip>:8765/healthz
+   ```
+   It should return `{"ok": true, "engine": "williamtells"}`. Without `--cert`/`--key`, the
+   TLS handshake fails (`certificate required`).
+
+**Macs the host can't reach.** The dispatcher opens the connection to the Mac. When the network
+only allows connections out from the Mac (Wi-Fi client isolation, NAT, a one-way firewall between
+subnets), set up a WireGuard tunnel that the Mac dials out on, with `PersistentKeepalive`:
+- Route only the host's tunnel address into the tunnel.
+- Bind the agent to the Mac's tunnel address and allow only the host's tunnel address.
+- Put the Mac's tunnel address in the cert's SAN.
+
+Docker NATs the dispatcher's connections, so the Mac sees them coming from the host's tunnel
+address. On macOS, keep `wg-quick` running from a root LaunchDaemon with `AbandonProcessGroup` set.
+Without it, launchd kills `wireguard-go` when the launching script exits. `wg show` there takes
+the `utunN` name from `/var/run/wireguard/<iface>.name`, not the `wg-quick` name. Give the tunnel
+its own interface and subnet, separate from any blastbox egress overlay.
+
+**No egress on Mac workers.** The scanner never needs the network, and the seatbelt profile
+denies it (`(deny network*)`), even for a job that asks for egress. macOS has no equivalent of
+the Linux worker's egress namespace, so a job's net policy can't be honoured there.
+
 ### Use it
 
+The ingress is https only, and every route except `/v1/healthz` and `/v1/version` needs the
+ingress key (`BLASTBOX_API_KEY` in `.env`; Compose refuses to start without it). Compose reads
+`.env`, but your shell doesn't, so put the header in a private file first. Curl reads the header
+from the file, which keeps the key out of the process list:
+
 ```bash
-curl -F file=@qr.png -F engine=williamtells -F params=WTQRK_MODE=heavy http://HOST:8005/v1/jobs
-curl http://HOST:8005/v1/jobs/<job_id>              # status; result_summary.meta.detection_count
-curl http://HOST:8005/v1/jobs/<job_id>/metadata     # the decoded payloads (payload.fields.payloads)
-curl http://HOST:8005/v1/jobs/<job_id>/attestation  # signed receipt (with BLASTBOX_ATTEST_KEY)
+H=$(mktemp)    # 0600
+# On the host, from deploy/docker. Elsewhere, write `Authorization: Bearer <key>` into "$H" and
+# set CA to your copy of ca.crt.
+sed -nE 's/^BLASTBOX_API_KEY=([^[:space:]]*).*/Authorization: Bearer \1/p' .env > "$H"
+# ca.crt is public, but its directory is uid 10001's: copy it out
+CA=$(mktemp); sudo cat "$(sed -nE 's/^WILLIAMTELLS_TLS_DIR=([^[:space:]]*).*/\1/p' .env)/ca.crt" > "$CA"
+B="https://HOST:8005"; C=(--cacert "$CA" -H @"$H")
+curl "${C[@]}" -F file=@qr.png -F engine=williamtells -F params=WTQRK_MODE=heavy $B/v1/jobs
+curl "${C[@]}" $B/v1/jobs/<job_id>              # status; result_summary.meta.detection_count
+curl "${C[@]}" $B/v1/jobs/<job_id>/metadata     # the decoded payloads (payload.fields.payloads)
+curl "${C[@]}" $B/v1/jobs/<job_id>/attestation  # signed receipt (with BLASTBOX_ATTEST_KEY)
+rm -f "$H" "$CA"
 ```
+
+The browser UI can't send the key: reach it through a proxy that authenticates you and adds the
+header, or set `WTQRK_SERVE_UI=0`.
 
 Job params (allowlisted on the dispatcher), each sent as its own `params=KEY=VALUE` field:
 `WTQRK_MODE=default|heavy` (same as `/scan` and `/scan/heavy`) and
 `WTQRK_CONFIG=<mutation config JSON>` (same shape and limits as the API's `config`).
 
-**Loadout.** Loadout talks to the ingress (`LOADOUT_WILLIAMTELLS_URL=http://HOST:8005`), maps its
+**Loadout.** Loadout talks to the ingress (`LOADOUT_WILLIAMTELLS_URL=https://HOST:8005`,
+`LOADOUT_WILLIAMTELLS_CA=<ca.crt>`, `LOADOUT_WILLIAMTELLS_API_KEY=<the ingress key>`), maps its
 `mode` setting to `WTQRK_MODE`, and turns each decoded payload into a `url` or `qr_code` artifact.
 
 **Self-test gate.** A job on a Mac whose gate failed is `engine_error` (`self_test_failed`),

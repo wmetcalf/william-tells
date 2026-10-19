@@ -1,0 +1,4 @@
+# The image builds entirely from pinned git refs and needs nothing from this directory. Send no
+# context at all: in particular the real .env (database password, worker token) must never reach
+# a builder.
+*
