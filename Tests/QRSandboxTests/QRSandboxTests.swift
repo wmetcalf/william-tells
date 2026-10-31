@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import QRScanCore
 @testable import QRSandbox
 
 // MARK: - untrusted output validation
@@ -31,6 +32,21 @@ import Testing
             Issue.record("expected ok"); return
         }
         #expect(!full.budgetExhausted && none.isEmpty)
+    }
+
+    /// A maximal custom config (10,000 mutations) also runs the perspective pass's views, which
+    /// count as mutations: the validator must accept that total, and no more.
+    @Test func aMaximalConfigPlusThePerspectivePassIsAValidCount() throws {
+        func doc(_ n: Int) -> Data {
+            Data(#"{"schema":"wtqrk.scan/1","ok":true,"mode":"heavy","compute":"auto","report":{"imageDimensions":{"width":1,"height":1},"mutationsTried":\#(n),"detections":[]}}"#.utf8)
+        }
+        let max = QRScannerEngine.maxMutationsTried
+        #expect(max == MutationConfig.maxTotalMutations + 12)
+        guard case .ok(let scan, _) = try ScanOutputValidator.parse(doc(max)) else {
+            Issue.record("expected ok"); return
+        }
+        #expect(scan.mutationsTried == max)
+        #expect(throws: OutputError.self) { try ScanOutputValidator.parse(doc(max + 1)) }
     }
 
     @Test func budgetExhaustedMustBeABoolean() {

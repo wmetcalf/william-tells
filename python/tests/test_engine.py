@@ -120,6 +120,14 @@ class TestParseScanOutput:
         assert doc["budget_exhausted"] is True
         assert [w.code for w in warns] == ["scan_budget_exhausted"]
 
+    def test_a_maximal_config_plus_the_perspective_pass_is_a_valid_count(self):
+        raw = json.loads(_ok_doc([]))
+        raw["report"]["mutationsTried"] = wt.MAX_MUTATIONS_TRIED
+        assert parse_scan_output(json.dumps(raw).encode())[0]["mutations_tried"] == 10_012
+        raw["report"]["mutationsTried"] = wt.MAX_MUTATIONS_TRIED + 1
+        with pytest.raises(ValueError):
+            parse_scan_output(json.dumps(raw).encode())
+
     def test_an_older_scanner_without_the_flag_is_a_full_sweep(self):
         doc, warns = parse_scan_output(_ok_doc([DET]))
         assert doc["budget_exhausted"] is False and not warns

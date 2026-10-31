@@ -109,7 +109,7 @@ public enum ScanOutputValidator {
         return .ok(ValidScan(mode: clip(mode, 16), compute: clip(compute, 16),
                              imageWidth: try int(dims["width"], 1, 1 << 20),
                              imageHeight: try int(dims["height"], 1, 1 << 20),
-                             mutationsTried: try int(report["mutationsTried"], 0, 10_000),
+                             mutationsTried: try int(report["mutationsTried"], 0, QRScannerEngine.maxMutationsTried),
                              detections: dets, inputType: inputType, budgetExhausted: exhausted),
                    warnings: warnings)
     }

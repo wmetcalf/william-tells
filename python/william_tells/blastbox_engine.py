@@ -60,6 +60,10 @@ ACCELERATORS = frozenset({"gpu", "ane"})
 MAX_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_DETECTIONS = 256
 MAX_PAYLOAD_CHARS = 4096
+# Largest ``mutationsTried`` a scan can report: a maximal config (10,000 mutations) plus the
+# perspective pass's 4 stretches and up to 8 unwarped rectangles. Mirrors
+# ``QRScannerEngine.maxMutationsTried``.
+MAX_MUTATIONS_TRIED = 10_000 + 4 + 8
 _CONFIG_KEYS = frozenset({
     "scales", "brightnessDeltas", "contrastDeltas", "blurRadii", "rotationDegrees",
     "sharpenIntensities",
@@ -209,7 +213,7 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
         "compute": _str(doc.get("compute"), 16)[0],
         "image_width": _int(dims.get("width"), 1, 1 << 20),
         "image_height": _int(dims.get("height"), 1, 1 << 20),
-        "mutations_tried": _int(report.get("mutationsTried"), 0, 10_000),
+        "mutations_tried": _int(report.get("mutationsTried"), 0, MAX_MUTATIONS_TRIED),
         "budget_exhausted": exhausted,
         "detections": dets,
         "input_type": input_type,

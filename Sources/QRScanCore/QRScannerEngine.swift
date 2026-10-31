@@ -98,6 +98,9 @@ public actor QRScannerEngine {
     static let maxRectangles = 8
     /// Long side an unwarped rectangle is rendered at, at most (and at least, for small ones).
     static let unwarpMax = 2048
+    /// Largest `mutationsTried` a scan can report: a maximal config plus every perspective view.
+    /// Hosts validating scanner output bound it by this (the Python engine mirrors the value).
+    public static let maxMutationsTried = MutationConfig.maxTotalMutations + stretches.count + maxRectangles
     static let unwarpMin = 600
 
     struct Mutation: Hashable {
