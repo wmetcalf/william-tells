@@ -51,7 +51,11 @@ public actor QRScannerEngine {
 
     // MARK: - Public API
 
-    public func scan(imageData: Data, config: MutationConfig, earlyExit: Bool = false) async throws -> ScanReport {
+    /// `deadline`: stop trying mutations once it passes and report what was found so far, with
+    /// `budgetExhausted` set. A host that kills the scanner at a timeout passes one inside that
+    /// timeout, so a long sweep ends with its partial result instead of being killed with nothing.
+    public func scan(imageData: Data, config: MutationConfig, earlyExit: Bool = false,
+                     deadline: Date? = nil) async throws -> ScanReport {
         let cgImage = try Self.loadImage(from: imageData)
 
         let dimensions = ImageDimensions(
@@ -59,72 +63,245 @@ public actor QRScannerEngine {
             height: cgImage.height
         )
 
-        let (detections, mutationsTried) = try await runMutations(on: cgImage, config: config, earlyExit: earlyExit)
+        let (detections, mutationsTried, exhausted) = try runMutations(
+            on: cgImage, config: config, earlyExit: earlyExit, deadline: deadline)
 
         return ScanReport(
             imageDimensions: dimensions,
             mutationsTried: mutationsTried,
-            detections: detections
+            detections: detections,
+            budgetExhausted: exhausted
         )
     }
 
     // MARK: - Mutation Engine
 
-    private func runMutations(
-        on image: CGImage,
-        config: MutationConfig,
-        earlyExit: Bool
-    ) async throws -> (detections: [QRDetection], mutationsTried: Int) {
+    /// Long side of the tiles the first pass scans at native resolution. Vision downsamples a
+    /// large frame, so a photo of many small codes reads only a few of them whole (3 of 60 on a
+    /// 12 MP test photo; 46-60 of 60 with these tiles).
+    static let tileSize = 1024
+    /// Tiles overlap by a quarter, so a code up to that size lies wholly inside some tile.
+    static let tileStep = 768
+    /// Images whose long side is at most this are not tiled (a tile would be most of the image).
+    static let tileThreshold = 1536
+    /// Largest image a mutation renders. Mutating a 48 MP photo at 2x would render ~190 MP
+    /// (~770 MB per frame) for no gain: Vision downsamples it again. Scales are clamped so the
+    /// output stays under this; scales that clamp to the same value run once.
+    static let maxWorkingPixels = 4096 * 4096
 
-        // 1. Try the raw image first — skip mutations entirely if we get results
-        let initial = try scanWithVision(image)
-        if !initial.isEmpty {
-            return (initial, 0)
-        }
+    /// Axis stretches for a code photographed at a steep angle (foreshortened to a half or a
+    /// third of its width or height): Vision gives up on it, but reads it once it is stretched
+    /// back. (8 of 12 such misses on the BoofCV perspective set.)
+    static let stretches: [(x: Double, y: Double)] = [(2, 1), (3, 1), (1, 2), (1, 3)]
+    /// Most rectangles the perspective pass unwarps (Vision's rectangle detector, then
+    /// CIPerspectiveCorrection): the paper or sticker a code is printed on is usually one.
+    static let maxRectangles = 8
+    /// Long side an unwarped rectangle is rendered at, at most (and at least, for small ones).
+    static let unwarpMax = 2048
+    static let unwarpMin = 600
 
-        // 2. Nothing found on raw image — run mutations
-        // Dedup key includes payload + approximate bbox so distinct QRs with the same
-        // payload at different locations are preserved
-        var seen = Set<String>()
-        var detections: [QRDetection] = []
-        var mutationsTried = 0
+    struct Mutation: Hashable {
+        let scale: Double, brightness: Double, contrast: Double
+        let blur: Double, rotation: Double, sharpen: Double
+    }
 
-        for scale in config.resolvedScales {
-            for brightness in config.resolvedBrightnessDeltas {
-                for contrast in config.resolvedContrastDeltas {
-                    for blur in config.resolvedBlurRadii {
-                        for rotation in config.resolvedRotationDegrees {
-                            for sharpen in config.resolvedSharpenIntensities {
-
-                                if blur == 0.0 && sharpen > 0.0 { continue }
-
-                                mutationsTried += 1
-
-                                guard let mutated = applyMutation(to: image,
-                                    scale: scale, brightness: brightness, contrast: contrast,
-                                    blur: blur, rotation: rotation, sharpen: sharpen
-                                ) else { continue }
-
-                                let results = try scanWithVision(mutated)
-
-                                var foundNew = false
-                                for det in results {
-                                    let key = "\(det.payload)|\(Int(det.boundingBox.x * 10))|\(Int(det.boundingBox.y * 10))"
-                                    guard !seen.contains(key) else { continue }
-                                    seen.insert(key)
-                                    detections.append(det)
-                                    foundNew = true
+    /// The config's mutations in the order they run: those in the default config first (so a
+    /// sweep cut short by its deadline has at least tried what a default scan tries), then the
+    /// rest in config order. Blur-free sharpening is skipped, as it always was; clamped
+    /// duplicates are dropped.
+    static func orderedMutations(_ config: MutationConfig, width: Int, height: Int) -> [Mutation] {
+        let pixels = Double(width) * Double(height)
+        let maxScale = (Double(maxWorkingPixels) / max(pixels, 1)).squareRoot()
+        func product(_ c: MutationConfig) -> [Mutation] {
+            var out: [Mutation] = []
+            for scale in c.resolvedScales {
+                for brightness in c.resolvedBrightnessDeltas {
+                    for contrast in c.resolvedContrastDeltas {
+                        for blur in c.resolvedBlurRadii {
+                            for rotation in c.resolvedRotationDegrees {
+                                for sharpen in c.resolvedSharpenIntensities {
+                                    if blur == 0.0 && sharpen > 0.0 { continue }
+                                    out.append(Mutation(scale: min(scale, maxScale), brightness: brightness,
+                                                        contrast: contrast, blur: blur, rotation: rotation,
+                                                        sharpen: sharpen))
                                 }
-
-                                if earlyExit && foundNew { return (detections, mutationsTried) }
                             }
                         }
                     }
                 }
             }
+            return out
+        }
+        let all = product(config)
+        let preferred = Set(product(.default))
+        var seen = Set<Mutation>()
+        return (all.filter { preferred.contains($0) } + all.filter { !preferred.contains($0) })
+            .filter { seen.insert($0).inserted }
+    }
+
+    /// Tile rects (pixel coordinates, top-left origin) covering the image, or [] when it is
+    /// small enough to scan whole.
+    static func tileRects(width: Int, height: Int) -> [CGRect] {
+        guard max(width, height) > tileThreshold else { return [] }
+        func starts(_ length: Int) -> [Int] {
+            guard length > tileSize else { return [0] }
+            var out = Array(stride(from: 0, to: length - tileSize, by: tileStep))
+            out.append(length - tileSize)
+            return out
+        }
+        return starts(height).flatMap { y in
+            starts(width).map { x in
+                CGRect(x: x, y: y, width: min(tileSize, width), height: min(tileSize, height))
+            }
+        }
+    }
+
+    /// Detections merged across passes. Two are the same code when the payload matches and
+    /// their centers are within half a box of each other, so distinct codes with one payload
+    /// at different places are all kept.
+    struct DetectionSet {
+        private(set) var items: [QRDetection] = []
+
+        @discardableResult
+        mutating func add(_ dets: [QRDetection]) -> Bool {
+            var foundNew = false
+            for d in dets where !items.contains(where: { Self.same($0, d) }) {
+                items.append(d)
+                foundNew = true
+            }
+            return foundNew
         }
 
-        return (detections, mutationsTried)
+        static func same(_ a: QRDetection, _ b: QRDetection) -> Bool {
+            guard a.payload == b.payload else { return false }
+            let (ab, bb) = (a.boundingBox, b.boundingBox)
+            return abs((ab.x + ab.width / 2) - (bb.x + bb.width / 2)) < max(ab.width, bb.width) / 2
+                && abs((ab.y + ab.height / 2) - (bb.y + bb.height / 2)) < max(ab.height, bb.height) / 2
+        }
+    }
+
+    private func runMutations(
+        on image: CGImage,
+        config: MutationConfig,
+        earlyExit: Bool,
+        deadline: Date?
+    ) throws -> (detections: [QRDetection], mutationsTried: Int, budgetExhausted: Bool) {
+        func expired() -> Bool { deadline.map { Date() >= $0 } ?? false }
+        var found = DetectionSet()
+
+        // 1. The raw image, whole and in native-resolution tiles. Any hit here skips mutations.
+        found.add(try scanWithVision(image))
+        for rect in Self.tileRects(width: image.width, height: image.height) {
+            if expired() { return (found.items, 0, true) }
+            guard let tile = image.cropping(to: rect) else { continue }
+            found.add(try scanWithVision(tile, symbologies: Self.tileSymbologies).map { Self.toFullImage($0, tile: rect, of: image) })
+        }
+        if !found.items.isEmpty {
+            return (found.items, 0, false)
+        }
+
+        // 2. Nothing found on the raw image: undo a steep viewing angle (stretches, then unwarped
+        // rectangles), then the brightness/contrast/... mutations — until the deadline. Every
+        // view counts as a mutation tried.
+        var mutationsTried = 0
+        for view in perspectiveViews(of: image) {
+            if expired() { return (found.items, mutationsTried, true) }
+            mutationsTried += 1
+            let foundNew = try autoreleasepool { () -> Bool in
+                guard let (rendered, box) = view() else { return false }
+                // Boxes in a stretched view are already in the image's normalized coordinates;
+                // in an unwarped rectangle they are reported as that rectangle's bounds.
+                return found.add(try scanWithVision(rendered).map { d in
+                    box.map { QRDetection(payload: d.payload, symbology: d.symbology,
+                                          confidence: d.confidence, boundingBox: $0) } ?? d
+                })
+            }
+            if earlyExit && foundNew { return (found.items, mutationsTried, false) }
+        }
+        for m in Self.orderedMutations(config, width: image.width, height: image.height) {
+            if expired() { return (found.items, mutationsTried, true) }
+            mutationsTried += 1
+            // Each mutation renders a full frame and Vision allocates per request; without a
+            // pool per iteration those autoreleased buffers pile up until the sweep ends
+            // (gigabytes on a large photo).
+            let foundNew = try autoreleasepool { () -> Bool in
+                guard let mutated = applyMutation(to: image,
+                    scale: m.scale, brightness: m.brightness, contrast: m.contrast,
+                    blur: m.blur, rotation: m.rotation, sharpen: m.sharpen
+                ) else { return false }
+                return found.add(try scanWithVision(mutated))
+            }
+            if earlyExit && foundNew { return (found.items, mutationsTried, false) }
+        }
+
+        return (found.items, mutationsTried, false)
+    }
+
+    /// Renderers for the perspective pass, run one at a time (each inside the caller's pool).
+    /// A renderer returns the view, plus the box to report for its detections when the view's
+    /// coordinates aren't the image's.
+    private func perspectiveViews(of image: CGImage) -> [() -> (CGImage, BoundingBox?)?] {
+        let source = CIImage(cgImage: image)
+        let (w, h) = (Double(image.width), Double(image.height))
+        var views: [() -> (CGImage, BoundingBox?)?] = Self.stretches.map { s in
+            { [ciContext] in
+                // Keep the stretched frame inside the working size.
+                let k = min(1, (Double(Self.maxWorkingPixels) / (w * s.x * h * s.y)).squareRoot())
+                let out = source.transformed(by: CGAffineTransform(scaleX: s.x * k, y: s.y * k))
+                return ciContext.createCGImage(out, from: out.extent).map { ($0, nil) }
+            }
+        }
+        let request = VNDetectRectanglesRequest()
+        request.maximumObservations = Self.maxRectangles
+        request.minimumAspectRatio = 0.1          // a square seen edge-on is a thin quad
+        request.quadratureTolerance = 45
+        request.minimumSize = 0.02
+        request.minimumConfidence = 0.3
+        // No rectangles is just no unwarped views; the stretches still run.
+        let rects: [VNRectangleObservation] = autoreleasepool {
+            (try? VNImageRequestHandler(cgImage: image, options: [:]).perform([request])) != nil
+                ? Array((request.results ?? []).prefix(Self.maxRectangles)) : []
+        }
+        views += rects.map { o in
+            { [ciContext] in
+                func px(_ p: CGPoint) -> CIVector { CIVector(x: p.x * w, y: p.y * h) }
+                let flat = source.applyingFilter("CIPerspectiveCorrection", parameters: [
+                    "inputTopLeft": px(o.topLeft), "inputTopRight": px(o.topRight),
+                    "inputBottomLeft": px(o.bottomLeft), "inputBottomRight": px(o.bottomRight)])
+                guard flat.extent.width >= 1, flat.extent.height >= 1 else { return nil }
+                // Square it up (the quad was a square seen at an angle), at a size Vision reads
+                // well, on a white quiet zone.
+                let side = min(Double(Self.unwarpMax), max(Double(Self.unwarpMin),
+                                                           flat.extent.width, flat.extent.height))
+                let pad = 40.0
+                let square = flat
+                    .transformed(by: CGAffineTransform(translationX: -flat.extent.minX, y: -flat.extent.minY))
+                    .transformed(by: CGAffineTransform(scaleX: side / flat.extent.width,
+                                                       y: side / flat.extent.height))
+                    .transformed(by: CGAffineTransform(translationX: pad, y: pad))
+                let page = square.composited(over: CIImage(color: .white)
+                    .cropped(to: CGRect(x: 0, y: 0, width: side + 2 * pad, height: side + 2 * pad)))
+                guard let cg = ciContext.createCGImage(page, from: page.extent) else { return nil }
+                let b = o.boundingBox
+                return (cg, BoundingBox(x: b.minX, y: b.minY, width: b.width, height: b.height))
+            }
+        }
+        return views
+    }
+
+    /// A detection in a tile, with its box mapped to the whole image's normalized coordinates
+    /// (Vision boxes have a bottom-left origin; tile rects are top-left).
+    static func toFullImage(_ d: QRDetection, tile r: CGRect, of image: CGImage) -> QRDetection {
+        let (w, h) = (Double(image.width), Double(image.height))
+        let bb = d.boundingBox
+        let bottom = h - Double(r.maxY)
+        return QRDetection(
+            payload: d.payload, symbology: d.symbology, confidence: d.confidence,
+            boundingBox: BoundingBox(
+                x: (Double(r.minX) + bb.x * Double(r.width)) / w,
+                y: (bottom + bb.y * Double(r.height)) / h,
+                width: bb.width * Double(r.width) / w,
+                height: bb.height * Double(r.height) / h))
     }
 
     // MARK: - Apply Mutations via CoreImage
@@ -173,7 +350,22 @@ public actor QRScannerEngine {
 
     // MARK: - Vision Framework Scan
 
-    private func scanWithVision(_ image: CGImage) throws -> [QRDetection] {
+    /// Every symbology the scanner reports.
+    static let allSymbologies: [VNBarcodeSymbology] = [
+        .qr, .microQR, .dataMatrix, .pdf417, .aztec, .code128, .code39, .code93, .ean8, .ean13,
+        .upce, .itf14, .gs1DataBar, .gs1DataBarExpanded, .codabar,
+    ]
+    /// The tiles look for QR codes only (what a phone camera acts on): asking Vision for every
+    /// symbology roughly doubled the tile pass's cost (Data Matrix and Aztec most of it). The
+    /// whole frame and every mutation still look for all of them.
+    static let tileSymbologies: [VNBarcodeSymbology] = [.qr, .microQR]
+
+    private func scanWithVision(_ image: CGImage,
+                                symbologies: [VNBarcodeSymbology] = allSymbologies) throws -> [QRDetection] {
+        try autoreleasepool { try scanWithVisionUnpooled(image, symbologies: symbologies) }
+    }
+
+    private func scanWithVisionUnpooled(_ image: CGImage, symbologies: [VNBarcodeSymbology]) throws -> [QRDetection] {
         var detections: [QRDetection] = []
         var scanError: Error?
 
@@ -186,7 +378,9 @@ public actor QRScannerEngine {
             guard let results = request.results as? [VNBarcodeObservation] else { return }
 
             for obs in results {
-                guard let payload = obs.payloadStringValue else { continue }
+                // An empty payload is noise, not a code: Vision reports one (as Micro QR) on some
+                // heavily distorted QR texture once it is mutated.
+                guard let payload = obs.payloadStringValue, !payload.isEmpty else { continue }
 
                 detections.append(QRDetection(
                     payload: payload,
@@ -202,30 +396,16 @@ public actor QRScannerEngine {
             }
         }
 
-        request.symbologies = [
-            VNBarcodeSymbology.qr,
-            VNBarcodeSymbology.microQR,
-            VNBarcodeSymbology.dataMatrix,
-            VNBarcodeSymbology.pdf417,
-            VNBarcodeSymbology.aztec,
-            VNBarcodeSymbology.code128,
-            VNBarcodeSymbology.code39,
-            VNBarcodeSymbology.code93,
-            VNBarcodeSymbology.ean8,
-            VNBarcodeSymbology.ean13,
-            VNBarcodeSymbology.upce,
-            VNBarcodeSymbology.itf14,
-            VNBarcodeSymbology.gs1DataBar,
-            VNBarcodeSymbology.gs1DataBarExpanded,
-            VNBarcodeSymbology.codabar
-        ]
+        request.symbologies = symbologies
 
         request.usesCPUOnly = false
         try applyComputePreference(to: request)
 
+        // One context for the whole scan (a new one per request was a fresh GPU context and
+        // its caches for every mutation).
         var options: [VNImageOption: Any] = [:]
-        if let device = metalDevice {
-            options[.ciContext] = CIContext(mtlDevice: device)
+        if metalDevice != nil {
+            options[.ciContext] = ciContext
         }
         let handler = VNImageRequestHandler(cgImage: image, options: options)
         try handler.perform([request])

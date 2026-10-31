@@ -36,7 +36,7 @@ public struct MutationConfig: Codable, Sendable {
         sharpenIntensities: [0.0]
     )
 
-    // Heavy — full sweep across all mutation axes (~6,000 mutations)
+    // Heavy — full sweep across all mutation axes (~6,000 mutations; hosts bound it with a deadline)
     public static let heavy = MutationConfig(
         scales:             [0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
         brightnessDeltas:   [-0.3, -0.15, 0.0, 0.15, 0.3],
@@ -154,11 +154,26 @@ public struct ScanReport: Codable, Sendable {
     public let imageDimensions: ImageDimensions
     public let mutationsTried: Int
     public let detections: [QRDetection]
+    /// The scan stopped at its deadline before trying every mutation: `detections` is what it
+    /// found until then, and a clean result is not a full sweep.
+    public let budgetExhausted: Bool
 
-    public init(imageDimensions: ImageDimensions, mutationsTried: Int, detections: [QRDetection]) {
+    public init(imageDimensions: ImageDimensions, mutationsTried: Int, detections: [QRDetection],
+                budgetExhausted: Bool = false) {
         self.imageDimensions = imageDimensions
         self.mutationsTried = mutationsTried
         self.detections = detections
+        self.budgetExhausted = budgetExhausted
+    }
+
+    enum CodingKeys: String, CodingKey { case imageDimensions, mutationsTried, detections, budgetExhausted }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        imageDimensions = try c.decode(ImageDimensions.self, forKey: .imageDimensions)
+        mutationsTried = try c.decode(Int.self, forKey: .mutationsTried)
+        detections = try c.decode([QRDetection].self, forKey: .detections)
+        budgetExhausted = try c.decodeIfPresent(Bool.self, forKey: .budgetExhausted) ?? false
     }
 }
 

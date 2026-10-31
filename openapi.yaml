@@ -490,6 +490,12 @@ components:
         mutationsTried:
           type: integer
           description: "Number of mutations tried. 0 means decoded on raw image."
+        budgetExhausted:
+          type: boolean
+          description: >-
+            The scan stopped at its time budget before trying every mutation (sandboxed hosts set
+            one inside their kill timeout). `detections` is what was found until then; an empty
+            result is not a full sweep.
         detections:
           type: array
           items:

@@ -66,10 +66,20 @@ public enum ScanExit: Int32, Sendable {
 }
 
 public enum ScanJob {
+    /// How long a scan may sweep when its host kills it after `timeout` seconds: the rest is
+    /// headroom for process start-up, the mutation in flight when the deadline passes, and
+    /// writing the result. (The Python engine mirrors this.)
+    public static func budget(forTimeout timeout: TimeInterval) -> TimeInterval {
+        max(1, timeout - max(5, timeout * 0.2))
+    }
+
     /// Scan one image. Same early-exit semantics as the web API: default stops at the first
-    /// hit, heavy sweeps every mutation.
+    /// hit, heavy sweeps every mutation -- both only until `budget` seconds have passed, when
+    /// one is given (the report then says `budgetExhausted`).
     public static func scan(data: Data, heavy: Bool, configJSON: String?,
-                            compute: ComputePreference) async -> (ScanOutput, ScanExit) {
+                            compute: ComputePreference,
+                            budget: TimeInterval? = nil) async -> (ScanOutput, ScanExit) {
+        let deadline = budget.map { Date().addingTimeInterval($0) }
         let mode = heavy ? "heavy" : "default"
         let inputType = QRScannerEngine.inputType(data)
         func fail(_ code: String, _ message: String, _ exit: ScanExit) -> (ScanOutput, ScanExit) {
@@ -87,7 +97,7 @@ public enum ScanJob {
         }
         do {
             let report = try await QRScannerEngine(compute: compute)
-                .scan(imageData: data, config: config, earlyExit: !heavy)
+                .scan(imageData: data, config: config, earlyExit: !heavy, deadline: deadline)
             return (ScanOutput(schema: scanSchema, ok: true, mode: mode, compute: compute.rawValue,
                                report: report, error: nil, inputType: inputType), .ok)
         } catch let error as ScanError {

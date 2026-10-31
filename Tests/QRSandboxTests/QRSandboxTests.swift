@@ -18,6 +18,27 @@ import Testing
         #expect(scan.imageWidth == 390 && scan.mutationsTried == 0 && warnings.isEmpty)
     }
 
+    func reportDoc(_ extra: String) -> Data {
+        Data(#"{"schema":"wtqrk.scan/1","ok":true,"mode":"heavy","compute":"auto","report":{"imageDimensions":{"width":390,"height":390},"mutationsTried":7,"detections":[]\#(extra)}}"#.utf8)
+    }
+
+    @Test func aBudgetCutSweepIsFlaggedWithAWarning() throws {
+        guard case .ok(let scan, let warnings) = try ScanOutputValidator.parse(reportDoc(#","budgetExhausted":true"#)) else {
+            Issue.record("expected ok"); return
+        }
+        #expect(scan.budgetExhausted && warnings.map(\.code) == ["scan_budget_exhausted"])
+        guard case .ok(let full, let none) = try ScanOutputValidator.parse(reportDoc("")) else {
+            Issue.record("expected ok"); return
+        }
+        #expect(!full.budgetExhausted && none.isEmpty)
+    }
+
+    @Test func budgetExhaustedMustBeABoolean() {
+        for bad in ["1", #""true""#, "[]"] {
+            #expect(throws: OutputError.self) { try ScanOutputValidator.parse(reportDoc(#","budgetExhausted":"# + bad)) }
+        }
+    }
+
     @Test func scannerReportedFailureIsPassedThrough() throws {
         let d = Data(#"{"schema":"wtqrk.scan/1","ok":false,"error":{"code":"invalid_image","message":"nope"}}"#.utf8)
         guard case .failed(let code, let message) = try ScanOutputValidator.parse(d) else {

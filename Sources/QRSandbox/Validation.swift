@@ -18,6 +18,8 @@ public struct ValidScan: Sendable, Codable {
     public let detections: [ValidDetection]
     /// The scanner's `inputType`, already checked against `QRScannerEngine.inputMIMEs`.
     public var inputType: String? = nil
+    /// The scan stopped at its deadline before trying every mutation.
+    public var budgetExhausted: Bool = false
 }
 
 public struct ScanWarning: Sendable, Equatable, Codable {
@@ -92,11 +94,23 @@ public enum ScanOutputValidator {
         guard let mode = doc["mode"] as? String, let compute = doc["compute"] as? String else {
             throw OutputError("mode/compute must be strings")
         }
+        var exhausted = false
+        if let e = report["budgetExhausted"], !(e is NSNull) {
+            guard let n = e as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() else {
+                throw OutputError("budgetExhausted must be a boolean")
+            }
+            exhausted = n.boolValue
+        }
+        if exhausted {
+            warnings.append(ScanWarning(code: "scan_budget_exhausted",
+                                        message: "the scan hit its time budget before trying "
+                                            + "every mutation; an empty result is not a full sweep"))
+        }
         return .ok(ValidScan(mode: clip(mode, 16), compute: clip(compute, 16),
                              imageWidth: try int(dims["width"], 1, 1 << 20),
                              imageHeight: try int(dims["height"], 1, 1 << 20),
                              mutationsTried: try int(report["mutationsTried"], 0, 10_000),
-                             detections: dets, inputType: inputType),
+                             detections: dets, inputType: inputType, budgetExhausted: exhausted),
                    warnings: warnings)
     }
 

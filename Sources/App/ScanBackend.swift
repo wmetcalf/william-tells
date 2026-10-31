@@ -69,7 +69,8 @@ struct SandboxedBackend: ScanBackend {
                     QRDetection(payload: $0.payload, symbology: $0.symbology, confidence: Float($0.confidence),
                                 boundingBox: BoundingBox(x: $0.bboxX, y: $0.bboxY, width: $0.bboxW,
                                                          height: $0.bboxH))
-                })
+                },
+                budgetExhausted: s.budgetExhausted)
         case .rejected(let code, let message), .engineError(let code, let message):
             throw Failed(code: code, message: message)
         }

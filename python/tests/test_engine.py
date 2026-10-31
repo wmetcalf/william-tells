@@ -113,7 +113,45 @@ class TestParseScanOutput:
         assert len(doc["detections"][0]["payload"]) == wt.MAX_PAYLOAD_CHARS
 
 
+    def test_budget_exhausted_is_carried_with_a_warning(self):
+        raw = json.loads(_ok_doc([]))
+        raw["report"]["budgetExhausted"] = True
+        doc, warns = parse_scan_output(json.dumps(raw).encode())
+        assert doc["budget_exhausted"] is True
+        assert [w.code for w in warns] == ["scan_budget_exhausted"]
+
+    def test_an_older_scanner_without_the_flag_is_a_full_sweep(self):
+        doc, warns = parse_scan_output(_ok_doc([DET]))
+        assert doc["budget_exhausted"] is False and not warns
+
+    @pytest.mark.parametrize("bad", [1, "true", [], {}])
+    def test_budget_exhausted_must_be_a_boolean(self, bad):
+        raw = json.loads(_ok_doc([]))
+        raw["report"]["budgetExhausted"] = bad
+        with pytest.raises(ValueError, match="budgetExhausted"):
+            parse_scan_output(json.dumps(raw).encode())
+
+
+@pytest.mark.parametrize("timeout,budget", [(120, 96.0), (20, 15.0), (6, 1.0), (1, 1.0), (3600, 2880.0)])
+def test_scan_budget_leaves_headroom_inside_the_timeout(timeout, budget):
+    assert wt.scan_budget(timeout) == budget
+
+
 class TestDetonate:
+    def test_the_scan_budget_fits_inside_the_job_timeout(self, tmp_path):
+        eng, sb = _engine(tmp_path, _ok_doc([DET]))
+        eng.detonate(_input(tmp_path), tmp_path, Limits(timeout_s=30))
+        argv = sb.requests[-1].argv
+        assert argv[argv.index("--budget-ms") + 1] == "24000"
+
+    def test_a_partial_sweep_is_ok_but_flagged(self, tmp_path):
+        raw = json.loads(_ok_doc([]))
+        raw["report"]["budgetExhausted"] = True
+        eng, _ = _engine(tmp_path, json.dumps(raw).encode())
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "ok" and res.payload.fields["budget_exhausted"] is True
+        assert [w.code for w in res.warnings] == ["scan_budget_exhausted"]
+
     def test_maps_to_record_and_requests_accelerators(self, tmp_path):
         eng, sb = _engine(tmp_path, _ok_doc([DET]))
         res = eng.detonate(_input(tmp_path), tmp_path, Limits())

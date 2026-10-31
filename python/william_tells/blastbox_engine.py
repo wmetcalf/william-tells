@@ -28,6 +28,10 @@ Operator configuration (worker env, never job params):
 Per-job params (forwarded by the dispatcher; allowlist them with
 ``BLASTBOX_ENGINE_WILLIAMTELLS_PARAM_KEYS=WTQRK_MODE,WTQRK_CONFIG``):
   WTQRK_MODE            ``default`` (~60 mutations, stop at first hit) or ``heavy`` (full sweep)
+
+Either mode sweeps only inside the job's timeout (``scan_budget``): when the budget runs out the
+scanner stops and reports what it found, flagged ``budget_exhausted`` with a
+``scan_budget_exhausted`` warning, instead of being killed with nothing.
   WTQRK_CONFIG          JSON mutation config, same shape and limits as the web API's ``config``
 """
 from __future__ import annotations
@@ -133,6 +137,13 @@ def _str(v: Any, limit: int) -> tuple[str, bool]:
     return (v[:limit], len(v) > limit)
 
 
+def scan_budget(timeout_s: float) -> float:
+    """Seconds the scanner may sweep when the sandbox kills it after ``timeout_s``: the rest is
+    headroom for start-up, the mutation in flight at the deadline, and the result. Mirrors
+    ``ScanJob.budget(forTimeout:)`` in QRScanCore."""
+    return max(1.0, timeout_s - max(5.0, timeout_s * 0.2))
+
+
 def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
     """Validate wtqrk-scan's (untrusted) JSON. Returns the parsed doc + warnings.
 
@@ -183,6 +194,15 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
             "bbox_w": _num(bb.get("width"), 0.0, 10.0),
             "bbox_h": _num(bb.get("height"), 0.0, 10.0),
         })
+    exhausted = report.get("budgetExhausted", False)
+    if exhausted is None:
+        exhausted = False
+    if not isinstance(exhausted, bool):
+        raise ValueError("budgetExhausted must be a boolean")
+    if exhausted:
+        warnings.append(Warning(code="scan_budget_exhausted",
+                                message="the scan hit its time budget before trying every "
+                                        "mutation; an empty result is not a full sweep"))
     clean = {
         "ok": True,
         "mode": _str(doc.get("mode"), 16)[0],
@@ -190,6 +210,7 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
         "image_width": _int(dims.get("width"), 1, 1 << 20),
         "image_height": _int(dims.get("height"), 1, 1 << 20),
         "mutations_tried": _int(report.get("mutationsTried"), 0, 10_000),
+        "budget_exhausted": exhausted,
         "detections": dets,
         "input_type": input_type,
     }
@@ -311,7 +332,8 @@ class WilliamTellsEngine:
             return error(*bad, status="rejected")
         mode = os.environ.get("WTQRK_MODE", "default").strip() or "default"
         exe = self._require_bin()
-        argv = [str(exe), "scan", str(input), "--max-bytes", str(limits.max_input_bytes)]
+        argv = [str(exe), "scan", str(input), "--max-bytes", str(limits.max_input_bytes),
+                "--budget-ms", str(int(scan_budget(limits.timeout_s) * 1000))]
         if mode == "heavy":
             argv.append("--heavy")
         raw_cfg = os.environ.get("WTQRK_CONFIG", "").strip()
@@ -355,6 +377,7 @@ class WilliamTellsEngine:
             "image_width": doc["image_width"],
             "image_height": doc["image_height"],
             "mutations_tried": doc["mutations_tried"],
+            "budget_exhausted": doc["budget_exhausted"],
             "detection_count": len(dets),
             "payloads": [d["payload"] for d in dets],
             "detections": Record(fields={
