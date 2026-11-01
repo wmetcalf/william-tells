@@ -77,6 +77,7 @@ public enum BlastboxEnvelope {
                 "schema": schema, "mode": scan.mode, "compute": scan.compute,
                 "image_width": scan.imageWidth, "image_height": scan.imageHeight,
                 "mutations_tried": scan.mutationsTried, "detection_count": scan.detections.count,
+                "budget_exhausted": scan.budgetExhausted,
                 "payloads": scan.detections.map(\.payload),
                 "detections": ["_type": "record", "fields": dets],
             ], warnings: warnings)

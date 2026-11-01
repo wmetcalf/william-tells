@@ -1,6 +1,7 @@
 import AppKit
 import CoreImage
 import Foundation
+import Vision
 import ImageIO
 import Testing
 import zlib
@@ -84,15 +85,267 @@ import zlib
     }
 }
 
+@Suite struct ScanBudgetTests {
+    @Test func aPassedDeadlineStopsTheSweepAndSaysSo() async throws {
+        let png = try #require(blankPNG(width: 64, height: 64))
+        let report = try await QRScannerEngine().scan(imageData: png, config: .heavy, earlyExit: false,
+                                                      deadline: Date())
+        #expect(report.budgetExhausted && report.mutationsTried == 0 && report.detections.isEmpty)
+    }
+
+    @Test func withoutADeadlineTheSweepIsComplete() async throws {
+        let png = try #require(blankPNG(width: 64, height: 64))
+        let config = MutationConfig(scales: [1.0], brightnessDeltas: [0.0, 0.1], contrastDeltas: [0.0],
+                                    blurRadii: [0.0], rotationDegrees: [0.0], sharpenIntensities: [0.0])
+        let report = try await QRScannerEngine().scan(imageData: png, config: config, earlyExit: false)
+        // The two mutations, after the perspective pass's stretches (a blank page has no
+        // rectangles to unwarp).
+        #expect(!report.budgetExhausted && report.mutationsTried == 2 + QRScannerEngine.stretches.count)
+    }
+
+    @Test func theBudgetLeavesHeadroomInsideTheTimeout() {
+        #expect(ScanJob.budget(forTimeout: 120) == 96)
+        #expect(ScanJob.budget(forTimeout: 20) == 15)
+        #expect(ScanJob.budget(forTimeout: 1) == 1)
+    }
+
+    @Test func anOlderReportWithoutTheFlagDecodesAsComplete() throws {
+        let json = #"{"imageDimensions":{"width":1,"height":1},"mutationsTried":0,"detections":[]}"#
+        #expect(try JSONDecoder().decode(ScanReport.self, from: Data(json.utf8)).budgetExhausted == false)
+    }
+}
+
+@Suite struct MutationOrderTests {
+    @Test func heavyTriesTheDefaultMutationsFirst() {
+        let order = QRScannerEngine.orderedMutations(.heavy, width: 500, height: 500)
+        let defaults = QRScannerEngine.orderedMutations(.default, width: 500, height: 500)
+        #expect(order.count == 6000 && defaults.count == 60)
+        #expect(Array(order.prefix(defaults.count)) == defaults)
+        #expect(Set(order).count == order.count)
+    }
+
+    @Test func largeImagesAreNotRenderedPastTheWorkingSize() {
+        let (w, h) = (4032, 3024)
+        let order = QRScannerEngine.orderedMutations(.heavy, width: w, height: h)
+        let biggest = order.map { Double(w) * $0.scale * Double(h) * $0.scale }.max() ?? 0
+        #expect(biggest <= Double(QRScannerEngine.maxWorkingPixels) * 1.0001)
+        #expect(order.count < 6000 && Set(order).count == order.count)   // clamped scales merged
+    }
+}
+
+@Suite struct TilingTests {
+    @Test func smallImagesAreScannedWhole() {
+        #expect(QRScannerEngine.tileRects(width: 1536, height: 900).isEmpty)
+    }
+
+    @Test func tilesCoverTheImageAndOverlap() {
+        let (w, h) = (4032, 3024)
+        let rects = QRScannerEngine.tileRects(width: w, height: h)
+        #expect(rects.allSatisfy { $0.width == 1024 && $0.height == 1024 })
+        #expect(rects.allSatisfy { $0.minX >= 0 && $0.minY >= 0 && $0.maxX <= CGFloat(w) && $0.maxY <= CGFloat(h) })
+        // Every point is inside some tile (sampled on a grid, edges included).
+        for x in stride(from: 0, through: w - 1, by: 97) {
+            for y in stride(from: 0, through: h - 1, by: 97) {
+                #expect(rects.contains { $0.contains(CGPoint(x: x, y: y)) })
+            }
+        }
+        #expect(rects.contains { $0.maxX == CGFloat(w) } && rects.contains { $0.maxY == CGFloat(h) })
+    }
+
+    @Test func aTileDetectionMapsToTheWholeImage() throws {
+        let cs = try #require(CGColorSpace(name: CGColorSpace.sRGB))
+        let ctx = try #require(CGContext(data: nil, width: 2048, height: 2048, bitsPerComponent: 8,
+                                         bytesPerRow: 0, space: cs,
+                                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let image = try #require(ctx.makeImage())
+        // Tile = top-right quarter; a box filling the tile's bottom-left quarter.
+        let d = QRDetection(payload: "p", symbology: "qr", confidence: 1,
+                            boundingBox: BoundingBox(x: 0, y: 0, width: 0.5, height: 0.5))
+        let m = QRScannerEngine.toFullImage(d, tile: CGRect(x: 1024, y: 0, width: 1024, height: 1024), of: image)
+        #expect(m.boundingBox.x == 0.5 && m.boundingBox.y == 0.5)
+        #expect(m.boundingBox.width == 0.25 && m.boundingBox.height == 0.25)
+    }
+
+    @Test func theSamePayloadAtTwoPlacesIsTwoCodes() throws {
+        func det(_ x: Double) -> QRDetection {
+            QRDetection(payload: "same", symbology: "qr", confidence: 1,
+                        boundingBox: BoundingBox(x: x, y: 0.1, width: 0.05, height: 0.05))
+        }
+        var set = QRScannerEngine.DetectionSet()
+        try set.add([det(0.1), det(0.3)])
+        try set.add([det(0.101)])              // the first one again, seen by an overlapping tile
+        #expect(set.items.count == 2)
+    }
+
+    @Test func tilesComeBackInTileOrderWhateverTheWorkers() throws {
+        let messages = (0..<8).map { "https://example.com/order/\($0)" }
+        let png = try #require(gridPNG(messages, width: 3000, height: 2000, moduleScale: 3))
+        let image = try QRScannerEngine.loadImage(from: png)
+        let engine = QRScannerEngine()
+        let serial = try engine.scanTiles(of: image, workers: 1, expired: { false })
+        let parallel = try engine.scanTiles(of: image, workers: 4, expired: { false })
+        #expect(serial.detections.map { $0.map(\.payload) } == parallel.detections.map { $0.map(\.payload) })
+        #expect(!serial.expired && serial.detections.joined().count >= messages.count)
+    }
+
+    @Test func tilesStopAtTheDeadline() throws {
+        let png = try #require(blankPNG(width: 3000, height: 2000))
+        let tiles = try QRScannerEngine().scanTiles(of: try QRScannerEngine.loadImage(from: png), expired: { true })
+        #expect(tiles.expired && tiles.detections.joined().isEmpty)
+    }
+
+    /// Many small codes on a large page: Vision reads few of them from the whole frame, the
+    /// native-resolution tiles read them all.
+    @Test func manySmallCodesOnALargeImageAreAllFound() async throws {
+        let messages = (0..<12).map { "https://example.com/tile/\($0)" }
+        let png = try #require(gridPNG(messages, width: 4000, height: 3000, moduleScale: 3))
+        let report = try await QRScannerEngine().scan(imageData: png, config: .default, earlyExit: true)
+        #expect(Set(report.detections.map(\.payload)) == Set(messages))
+        #expect(report.detections.count == messages.count)
+    }
+}
+
+@Suite struct MicroQRMisreadTests {
+    static let micro = VNBarcodeSymbology.microQR.rawValue
+    static let qr = VNBarcodeSymbology.qr.rawValue
+
+    func det(_ payload: String, _ symbology: String, x: Double = 0.1, size: Double = 0.1) -> QRDetection {
+        QRDetection(payload: payload, symbology: symbology, confidence: 1,
+                    boundingBox: BoundingBox(x: x, y: 0.1, width: size, height: size))
+    }
+
+    @Test func aMicroQROnTheRawImageIsAcceptedAtOnce() throws {
+        var set = QRScannerEngine.DetectionSet()
+        let added = try set.add([det("347", Self.micro)])
+        #expect(added && set.items.map(\.payload) == ["347"])
+    }
+
+    /// Read once in a mutated view and not confirmed close up, a Micro QR neither ends an
+    /// early-exit scan nor is reported.
+    @Test func anUnconfirmedMicroQRFromAMutatedViewIsNotReported() throws {
+        var set = QRScannerEngine.DetectionSet()
+        let added = try set.add([det("347", Self.micro)], mutated: true, confirm: { _ in false })
+        #expect(!added && set.items.isEmpty)
+    }
+
+    @Test func aCloseReReadConfirmsItAtOnce() throws {
+        var set = QRScannerEngine.DetectionSet()
+        var asked: [Int] = []
+        let added = try set.add([det("real", Self.micro), det("junk", Self.micro, x: 0.6)], mutated: true,
+                                confirm: { asked.append($0); return $0 == 0 })
+        #expect(added && asked == [0, 1] && set.items.map(\.payload) == ["real"])
+    }
+
+    @Test func aSecondViewConfirmsIt() throws {
+        var set = QRScannerEngine.DetectionSet()
+        try set.add([det("347", Self.micro)], mutated: true)
+        let added = try set.add([det("347", Self.micro, x: 0.102)], mutated: true)
+        #expect(added && set.items.map(\.payload) == ["347"])
+    }
+
+    /// Vision can return one read twice, and every read in an unwarped rectangle carries the
+    /// rectangle's box: neither is a second view.
+    @Test func aViewCannotConfirmItsOwnRead() throws {
+        var set = QRScannerEngine.DetectionSet()
+        try set.add([det("347", Self.micro), det("347", Self.micro)], mutated: true, exactBoxes: false)
+        #expect(set.items.isEmpty)
+    }
+
+    @Test func aMicroQRLyingOnADecodedQRIsDropped() throws {
+        var set = QRScannerEngine.DetectionSet()
+        try set.add([det("https://example.com", Self.qr, x: 0.1, size: 0.5), det("2Z", Self.micro, x: 0.2)])
+        try set.add([det("elsewhere", Self.micro, x: 0.8)])
+        #expect(set.items.map(\.payload) == ["https://example.com", "elsewhere"])
+    }
+
+    /// An unwarped rectangle's box (a whole sheet, maybe most of the frame) is not the QR's own,
+    /// so it doesn't hide Micro QRs.
+    @Test func anApproximateQRBoxDropsNothing() throws {
+        var set = QRScannerEngine.DetectionSet()
+        try set.add([det("https://example.com", Self.qr, x: 0, size: 1)], mutated: true, exactBoxes: false)
+        try set.add([det("2Z", Self.micro, x: 0.2)])
+        #expect(set.items.map(\.payload) == ["https://example.com", "2Z"])
+    }
+
+    @Test func otherSymbologiesFromMutatedViewsAreAcceptedAtOnce() throws {
+        var set = QRScannerEngine.DetectionSet()
+        let added = try set.add([det("https://example.com", Self.qr)], mutated: true)
+        #expect(added && set.items.count == 1)
+    }
+}
+
+@Suite struct MutatedFrameTests {
+    func box(_ x: Double, _ y: Double, _ w: Double, _ h: Double) -> QRDetection {
+        QRDetection(payload: "p", symbology: "qr", confidence: 1, boundingBox: BoundingBox(x: x, y: y, width: w, height: h))
+    }
+
+    func close(_ a: BoundingBox, _ b: BoundingBox) -> Bool {
+        abs(a.x - b.x) < 1e-9 && abs(a.y - b.y) < 1e-9 && abs(a.width - b.width) < 1e-9 && abs(a.height - b.height) < 1e-9
+    }
+
+    @Test func aScaledFrameHasTheImagesCoordinates() {
+        let d = box(0.1, 0.2, 0.3, 0.4)
+        let m = QRScannerEngine.toImage(d, scale: 2, rotation: 0, frame: CGRect(x: 0, y: 0, width: 200, height: 100),
+                                        width: 100, height: 50)
+        #expect(close(m.boundingBox, d.boundingBox))
+    }
+
+    /// Rotating 100x50 by 90 degrees gives a frame at x -50...0: a box at pixels x 10-20,
+    /// y 5-15 lands at x -15...-5, y 10-20 there.
+    @Test func aRotatedFramesBoxMapsBack() {
+        let d = box(0.7, 0.1, 0.2, 0.1)
+        let m = QRScannerEngine.toImage(d, scale: 1, rotation: 90, frame: CGRect(x: -50, y: 0, width: 50, height: 100),
+                                        width: 100, height: 50)
+        #expect(close(m.boundingBox, BoundingBox(x: 0.1, y: 0.1, width: 0.1, height: 0.2)))
+    }
+}
+
+@Suite struct PerspectiveTests {
+    /// A code squashed to a third of its width (a steep viewing angle): the raw pass misses it,
+    /// the perspective pass reads it before any brightness/contrast mutation.
+    @Test func aForeshortenedCodeIsReadByStretchingItBack() async throws {
+        let message = "https://example.com/\(UUID().uuidString)"
+        let png = try #require(qrPNG(message, scaleX: 10.0 / 3, scaleY: 10))
+        let raw = try await QRScannerEngine().scan(imageData: png, config: MutationConfig(
+            scales: [1.0], brightnessDeltas: [0.0], contrastDeltas: [0.0], blurRadii: [0.0],
+            rotationDegrees: [0.0], sharpenIntensities: [0.0]), earlyExit: true, deadline: nil)
+        #expect(raw.detections.map(\.payload) == [message])
+        #expect(raw.mutationsTried >= 1 && raw.mutationsTried <= QRScannerEngine.stretches.count)
+    }
+}
+
 // MARK: - helpers
 
-private func qrPNG(_ message: String) -> Data? {
+private func qrPNG(_ message: String, scaleX: CGFloat = 10, scaleY: CGFloat = 10) -> Data? {
     let gen = CIFilter(name: "CIQRCodeGenerator")
     gen?.setValue(Data(message.utf8), forKey: "inputMessage")
-    guard let qr = gen?.outputImage?.transformed(by: CGAffineTransform(scaleX: 10, y: 10)) else { return nil }
+    guard let qr = gen?.outputImage?.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY)) else { return nil }
     let canvas = CIImage(color: .white).cropped(to: qr.extent.insetBy(dx: -40, dy: -40))
     guard let cs = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
     return CIContext().pngRepresentation(of: qr.composited(over: canvas), format: .RGBA8, colorSpace: cs)
+}
+
+private func blankPNG(width: Int, height: Int) -> Data? {
+    let img = CIImage(color: .white).cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
+    guard let cs = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+    return CIContext().pngRepresentation(of: img, format: .RGBA8, colorSpace: cs)
+}
+
+/// `messages` as small QRs spread over a white `width` x `height` page.
+private func gridPNG(_ messages: [String], width: Int, height: Int, moduleScale: CGFloat) -> Data? {
+    var page = CIImage(color: .white).cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
+    let cols = 4
+    for (i, m) in messages.enumerated() {
+        let gen = CIFilter(name: "CIQRCodeGenerator")
+        gen?.setValue(Data(m.utf8), forKey: "inputMessage")
+        guard let qr = gen?.outputImage?.transformed(by: CGAffineTransform(scaleX: moduleScale, y: moduleScale))
+        else { return nil }
+        let x = CGFloat(i % cols) * CGFloat(width) / CGFloat(cols) + 200
+        let y = CGFloat(i / cols) * CGFloat(height) / CGFloat((messages.count + cols - 1) / cols) + 200
+        page = qr.transformed(by: CGAffineTransform(translationX: x, y: y)).composited(over: page)
+    }
+    guard let cs = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+    return CIContext().pngRepresentation(of: page, format: .RGBA8, colorSpace: cs)
 }
 
 /// A complete, valid 1-bit grayscale PNG of all-zero pixels. ImageIO refuses a header-only PNG

@@ -151,7 +151,9 @@ public actor SandboxedScanner {
                                 message: "scanner failed its known-QR self-test in the sandbox; no "
                                     + "result is trustworthy until it passes: " + gate.detail)
         }
-        var argv = ["", "scan", "-", "--max-bytes", String(maxBytes)]
+        // Sweep only inside the kill timeout, so a long scan returns its partial result.
+        let budgetMs = Int(ScanJob.budget(forTimeout: limits.timeoutSeconds) * 1000)
+        var argv = ["", "scan", "-", "--max-bytes", String(maxBytes), "--budget-ms", String(budgetMs)]
         if heavy { argv.append("--heavy") }
         if let configJSON {
             do { argv += ["--config-json", try ScanOutputValidator.canonicalConfig(configJSON)] }

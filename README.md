@@ -83,7 +83,7 @@ Response (202 Accepted):
 }
 ```
 
-**`POST /scan/heavy`** — Full mutation sweep (~10,000 mutations, no early exit). Use when `/scan` finds nothing.
+**`POST /scan/heavy`** — Full mutation sweep (~6,000 mutations, no early exit). Use when `/scan` finds nothing.
 
 **`POST /scan/batch`** — Multiple images in one request (max 20):
 
@@ -134,7 +134,22 @@ Completed response:
 }
 ```
 
-`mutationsTried: 0` means the QR decoded on the raw image (no mutations needed).
+`mutationsTried: 0` means the QR decoded on the raw image (no mutations needed). The raw pass
+scans the whole frame and, for images over 1536 px on the long side, overlapping 1024 px tiles at
+native resolution: Vision downsamples a large frame, so a photo of many small codes would
+otherwise read only a few of them (the tiles look for QR / Micro QR only; the whole frame and
+the mutations look for every symbology). When the raw pass finds nothing, a perspective pass
+runs before the mutations, for codes photographed at a steep angle: the image stretched 2x and
+3x along each axis, then up to 8 rectangles from Vision's rectangle detector unwarped
+(`CIPerspectiveCorrection`) and squared up; each counts as a mutation tried. A code read from an
+unwarped rectangle is reported with that rectangle's bounds. `budgetExhausted: true` means the
+scan stopped at its time budget (see below) before trying every mutation.
+
+Vision sometimes misreads the texture of a damaged QR as a Micro QR once it is mutated, with a
+short junk payload (`347`, `2Z`). So a Micro QR read only from a mutated or unwarped view is
+reported only when a second view reads it too, or when it reads again from a close-up crop of
+the view it was seen in; and a Micro QR lying on a decoded QR is not reported. A Micro QR on the
+raw image is reported as read.
 
 ### Utility endpoints
 
@@ -174,7 +189,9 @@ The raw image is tried first. If no QR is detected, mutations are applied via Co
 | Rotation | Phone tilt |
 | Sharpen | Camera snapping to focus |
 
-Default config covers brightness extremes and contrast adjustments that catch most obfuscated QR codes in ~60 mutations. Heavy mode does a full sweep across all axes (~6,000 mutations).
+Default config covers brightness extremes and contrast adjustments that catch most obfuscated QR codes in ~60 mutations. Heavy mode does a full sweep across all axes (~6,000 mutations), trying the default config's mutations first. Mutations never render more than 4096x4096 pixels (larger scales are clamped), so a big photo isn't upscaled for nothing.
+
+A full heavy sweep takes minutes on a large photo (~30 mutations/s on an M4 Pro at 12 MP), longer than a sandboxed job's timeout. So the sandboxed hosts (`wtqrk-scan --budget-ms`, set by the blastbox engine and `wtqrk-worker` to the job timeout minus `max(5 s, 20%)`) stop the sweep at a time budget and return what was found, with `budgetExhausted: true` and a `scan_budget_exhausted` warning, rather than being killed with nothing.
 
 ## Architecture
 
@@ -379,6 +396,12 @@ plain HTTP for a local dispatcher only.
    | `BLASTBOX_WORKER_AGENT_TOKEN` | a random secret, also set on the dispatcher |
 
    Its log should show `self-test passed` and `tls=True mtls=True allowlist=True`.
+
+   **Upgrading:** install the new `wtqrk-scan` into `/opt/william-tells/bin` *before* the new
+   `william-tells-blastbox` into the venv, then restart the agent. The engine passes the scanner
+   flags it knows (`--budget-ms` since the scan budget was added); an older scanner refuses an
+   unknown flag, so a new engine on an old scanner fails every job, while a new scanner works
+   with the old engine.
 4. **Host stack.** Everything runs from `deploy/docker/`, because Compose only looks for
    `docker-compose.yml` and `.env` in the current directory and its parents:
    ```bash

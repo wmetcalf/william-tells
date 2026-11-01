@@ -6,7 +6,7 @@
 // long-lived state, nothing shared between images.
 //
 //   wtqrk-scan scan <image|-> [--heavy] [--config-json JSON] [--compute auto|ane|gpu|cpu]
-//                           [--max-bytes N]
+//                           [--max-bytes N] [--budget-ms N]
 //   wtqrk-scan self-test [--compute auto|ane|gpu|cpu]
 //   wtqrk-scan devices
 //   wtqrk-scan probe --read <path> --connect <port>   (confinement check for a sandbox host)
@@ -14,6 +14,9 @@
 //
 // `scan -` reads the image from stdin: the native sandbox host hands each scan an open file
 // descriptor, so the sandboxed process needs no file-path grant at all.
+//
+// `--budget-ms`: stop trying mutations after N ms and report what was found, flagged
+// `budgetExhausted` -- a host that kills the scanner at a timeout passes a budget inside it.
 //
 // Exit codes: 0 scanned (detections may be empty) / self-test passed; 1 internal or self-test
 // failure; 2 the input is not a usable image; 3 bad config; 64 usage.
@@ -53,7 +56,7 @@ func fail(_ code: String, _ message: String, _ exit: ScanExit, mode: String? = n
 
 func usage() -> ScanExit {
     FileHandle.standardError.write(Data("""
-    usage: wtqrk-scan scan <image|-> [--heavy] [--config-json JSON] [--compute auto|ane|gpu|cpu] [--max-bytes N]
+    usage: wtqrk-scan scan <image|-> [--heavy] [--config-json JSON] [--compute auto|ane|gpu|cpu] [--max-bytes N] [--budget-ms N]
            wtqrk-scan self-test [--compute auto|ane|gpu|cpu]
            wtqrk-scan devices
            wtqrk-scan render-qr <message> <out.png>
@@ -117,11 +120,16 @@ func readInput(_ path: String, maxBytes: Int) throws -> Data {
 }
 
 func runScan(_ argv: ArraySlice<String>) async -> ScanExit {
-    guard let args = Args(argv, valued: ["--config-json", "--compute", "--max-bytes"],
+    guard let args = Args(argv, valued: ["--config-json", "--compute", "--max-bytes", "--budget-ms"],
                           booleans: ["--heavy"]),
           args.positional.count == 1,
           let compute = parseCompute(args.options["--compute"])
     else { return usage() }
+    var budget: TimeInterval?
+    if let raw = args.options["--budget-ms"] {
+        guard let ms = Int(raw), ms > 0, ms <= 86_400_000 else { return usage() }
+        budget = TimeInterval(ms) / 1000
+    }
 
     let heavy = args.flags.contains("--heavy")
     let mode = heavy ? "heavy" : "default"
@@ -139,7 +147,8 @@ func runScan(_ argv: ArraySlice<String>) async -> ScanExit {
     }
 
     let (out, code) = await ScanJob.scan(data: data, heavy: heavy,
-                                         configJSON: args.options["--config-json"], compute: compute)
+                                         configJSON: args.options["--config-json"], compute: compute,
+                                         budget: budget)
     emit(out)
     return code
 }
