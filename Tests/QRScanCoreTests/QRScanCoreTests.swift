@@ -1,6 +1,7 @@
 import AppKit
 import CoreImage
 import Foundation
+import Vision
 import ImageIO
 import Testing
 import zlib
@@ -184,6 +185,80 @@ import zlib
         let report = try await QRScannerEngine().scan(imageData: png, config: .default, earlyExit: true)
         #expect(Set(report.detections.map(\.payload)) == Set(messages))
         #expect(report.detections.count == messages.count)
+    }
+}
+
+@Suite struct MicroQRMisreadTests {
+    static let micro = VNBarcodeSymbology.microQR.rawValue
+    static let qr = VNBarcodeSymbology.qr.rawValue
+
+    func det(_ payload: String, _ symbology: String, x: Double = 0.1, size: Double = 0.1) -> QRDetection {
+        QRDetection(payload: payload, symbology: symbology, confidence: 1,
+                    boundingBox: BoundingBox(x: x, y: 0.1, width: size, height: size))
+    }
+
+    func evidence() throws -> CGImage {
+        let cs = try #require(CGColorSpace(name: CGColorSpace.sRGB))
+        let ctx = try #require(CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        return try #require(ctx.makeImage())
+    }
+
+    @Test func aMicroQROnTheRawImageIsAcceptedAtOnce() {
+        var set = QRScannerEngine.DetectionSet()
+        let added = set.add([det("347", Self.micro)])
+        #expect(added && set.items.map(\.payload) == ["347"])
+    }
+
+    /// Seen once in a mutated view, a Micro QR is tentative: it neither ends an early-exit scan
+    /// nor is reported unless something confirms it.
+    @Test func aMicroQRSeenOnceInAMutatedViewIsTentative() {
+        var set = QRScannerEngine.DetectionSet()
+        let added = set.add([det("347", Self.micro)], mutated: true)
+        #expect(!added && set.items.isEmpty)
+        set.confirm { _, _ in Issue.record("no evidence to re-read"); return true }
+        #expect(set.items.isEmpty)
+    }
+
+    @Test func aSecondMutatedViewConfirmsIt() {
+        var set = QRScannerEngine.DetectionSet()
+        set.add([det("347", Self.micro)], mutated: true)
+        let added = set.add([det("347", Self.micro, x: 0.102)], mutated: true)
+        #expect(added && set.items.map(\.payload) == ["347"])
+    }
+
+    @Test func aCloseReReadOfItsEvidenceConfirmsIt() throws {
+        let image = try evidence()
+        var set = QRScannerEngine.DetectionSet()
+        set.add([det("real", Self.micro), det("junk", Self.micro, x: 0.6)], mutated: true,
+                evidence: { _ in image })
+        set.confirm { d, _ in d.payload == "real" }
+        #expect(set.items.map(\.payload) == ["real"])
+    }
+
+    /// Only the first few tentative reads keep their (up to 4 MB) evidence; the rest can still
+    /// be confirmed by a second view.
+    @Test func evidenceIsKeptForTheFirstFewTentativeReadsOnly() throws {
+        let image = try evidence()
+        var set = QRScannerEngine.DetectionSet()
+        let n = QRScannerEngine.DetectionSet.maxEvidence + 5
+        for i in 0..<n { set.add([det("junk\(i)", Self.micro)], mutated: true, evidence: { _ in image }) }
+        var reRead = 0
+        set.confirm { _, _ in reRead += 1; return false }
+        #expect(reRead == QRScannerEngine.DetectionSet.maxEvidence && set.items.isEmpty)
+    }
+
+    @Test func aMicroQRLyingOnADecodedQRIsDropped() {
+        var set = QRScannerEngine.DetectionSet()
+        set.add([det("https://example.com", Self.qr, x: 0.1, size: 0.5), det("2Z", Self.micro, x: 0.2)])
+        set.add([det("elsewhere", Self.micro, x: 0.8)])
+        #expect(set.items.map(\.payload) == ["https://example.com", "elsewhere"])
+    }
+
+    @Test func otherSymbologiesFromMutatedViewsAreAcceptedAtOnce() {
+        var set = QRScannerEngine.DetectionSet()
+        let added = set.add([det("https://example.com", Self.qr)], mutated: true)
+        #expect(added && set.items.count == 1)
     }
 }
 

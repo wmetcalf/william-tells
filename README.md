@@ -145,6 +145,12 @@ runs before the mutations, for codes photographed at a steep angle: the image st
 unwarped rectangle is reported with that rectangle's bounds. `budgetExhausted: true` means the
 scan stopped at its time budget (see below) before trying every mutation.
 
+Vision sometimes misreads the texture of a damaged QR as a Micro QR once it is mutated, with a
+short junk payload (`347`, `2Z`). So a Micro QR read only from a mutated or unwarped view is
+reported only when a second view reads it too, or when it reads again from a close-up crop of
+the view it was seen in; and a Micro QR lying on a decoded QR is not reported. A Micro QR on the
+raw image is reported as read.
+
 ### Utility endpoints
 
 - **`GET /health`** — Returns `ok`. No auth required.
