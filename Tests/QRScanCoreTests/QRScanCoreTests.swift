@@ -166,15 +166,32 @@ import zlib
         #expect(m.boundingBox.width == 0.25 && m.boundingBox.height == 0.25)
     }
 
-    @Test func theSamePayloadAtTwoPlacesIsTwoCodes() {
+    @Test func theSamePayloadAtTwoPlacesIsTwoCodes() throws {
         func det(_ x: Double) -> QRDetection {
             QRDetection(payload: "same", symbology: "qr", confidence: 1,
                         boundingBox: BoundingBox(x: x, y: 0.1, width: 0.05, height: 0.05))
         }
         var set = QRScannerEngine.DetectionSet()
-        set.add([det(0.1), det(0.3)])
-        set.add([det(0.101)])              // the first one again, seen by an overlapping tile
+        try set.add([det(0.1), det(0.3)])
+        try set.add([det(0.101)])              // the first one again, seen by an overlapping tile
         #expect(set.items.count == 2)
+    }
+
+    @Test func tilesComeBackInTileOrderWhateverTheWorkers() throws {
+        let messages = (0..<8).map { "https://example.com/order/\($0)" }
+        let png = try #require(gridPNG(messages, width: 3000, height: 2000, moduleScale: 3))
+        let image = try QRScannerEngine.loadImage(from: png)
+        let engine = QRScannerEngine()
+        let serial = try engine.scanTiles(of: image, workers: 1, expired: { false })
+        let parallel = try engine.scanTiles(of: image, workers: 4, expired: { false })
+        #expect(serial.detections.map { $0.map(\.payload) } == parallel.detections.map { $0.map(\.payload) })
+        #expect(!serial.expired && serial.detections.joined().count >= messages.count)
+    }
+
+    @Test func tilesStopAtTheDeadline() throws {
+        let png = try #require(blankPNG(width: 3000, height: 2000))
+        let tiles = try QRScannerEngine().scanTiles(of: try QRScannerEngine.loadImage(from: png), expired: { true })
+        #expect(tiles.expired && tiles.detections.joined().isEmpty)
     }
 
     /// Many small codes on a large page: Vision reads few of them from the whole frame, the
@@ -197,68 +214,89 @@ import zlib
                     boundingBox: BoundingBox(x: x, y: 0.1, width: size, height: size))
     }
 
-    func evidence() throws -> CGImage {
-        let cs = try #require(CGColorSpace(name: CGColorSpace.sRGB))
-        let ctx = try #require(CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 0,
-                                         space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
-        return try #require(ctx.makeImage())
-    }
-
-    @Test func aMicroQROnTheRawImageIsAcceptedAtOnce() {
+    @Test func aMicroQROnTheRawImageIsAcceptedAtOnce() throws {
         var set = QRScannerEngine.DetectionSet()
-        let added = set.add([det("347", Self.micro)])
+        let added = try set.add([det("347", Self.micro)])
         #expect(added && set.items.map(\.payload) == ["347"])
     }
 
-    /// Seen once in a mutated view, a Micro QR is tentative: it neither ends an early-exit scan
-    /// nor is reported unless something confirms it.
-    @Test func aMicroQRSeenOnceInAMutatedViewIsTentative() {
+    /// Read once in a mutated view and not confirmed close up, a Micro QR neither ends an
+    /// early-exit scan nor is reported.
+    @Test func anUnconfirmedMicroQRFromAMutatedViewIsNotReported() throws {
         var set = QRScannerEngine.DetectionSet()
-        let added = set.add([det("347", Self.micro)], mutated: true)
+        let added = try set.add([det("347", Self.micro)], mutated: true, confirm: { _ in false })
         #expect(!added && set.items.isEmpty)
-        set.confirm { _, _ in Issue.record("no evidence to re-read"); return true }
+    }
+
+    @Test func aCloseReReadConfirmsItAtOnce() throws {
+        var set = QRScannerEngine.DetectionSet()
+        var asked: [Int] = []
+        let added = try set.add([det("real", Self.micro), det("junk", Self.micro, x: 0.6)], mutated: true,
+                                confirm: { asked.append($0); return $0 == 0 })
+        #expect(added && asked == [0, 1] && set.items.map(\.payload) == ["real"])
+    }
+
+    @Test func aSecondViewConfirmsIt() throws {
+        var set = QRScannerEngine.DetectionSet()
+        try set.add([det("347", Self.micro)], mutated: true)
+        let added = try set.add([det("347", Self.micro, x: 0.102)], mutated: true)
+        #expect(added && set.items.map(\.payload) == ["347"])
+    }
+
+    /// Vision can return one read twice, and every read in an unwarped rectangle carries the
+    /// rectangle's box: neither is a second view.
+    @Test func aViewCannotConfirmItsOwnRead() throws {
+        var set = QRScannerEngine.DetectionSet()
+        try set.add([det("347", Self.micro), det("347", Self.micro)], mutated: true, exactBoxes: false)
         #expect(set.items.isEmpty)
     }
 
-    @Test func aSecondMutatedViewConfirmsIt() {
+    @Test func aMicroQRLyingOnADecodedQRIsDropped() throws {
         var set = QRScannerEngine.DetectionSet()
-        set.add([det("347", Self.micro)], mutated: true)
-        let added = set.add([det("347", Self.micro, x: 0.102)], mutated: true)
-        #expect(added && set.items.map(\.payload) == ["347"])
-    }
-
-    @Test func aCloseReReadOfItsEvidenceConfirmsIt() throws {
-        let image = try evidence()
-        var set = QRScannerEngine.DetectionSet()
-        set.add([det("real", Self.micro), det("junk", Self.micro, x: 0.6)], mutated: true,
-                evidence: { _ in image })
-        set.confirm { d, _ in d.payload == "real" }
-        #expect(set.items.map(\.payload) == ["real"])
-    }
-
-    /// Only the first few tentative reads keep their (up to 4 MB) evidence; the rest can still
-    /// be confirmed by a second view.
-    @Test func evidenceIsKeptForTheFirstFewTentativeReadsOnly() throws {
-        let image = try evidence()
-        var set = QRScannerEngine.DetectionSet()
-        let n = QRScannerEngine.DetectionSet.maxEvidence + 5
-        for i in 0..<n { set.add([det("junk\(i)", Self.micro)], mutated: true, evidence: { _ in image }) }
-        var reRead = 0
-        set.confirm { _, _ in reRead += 1; return false }
-        #expect(reRead == QRScannerEngine.DetectionSet.maxEvidence && set.items.isEmpty)
-    }
-
-    @Test func aMicroQRLyingOnADecodedQRIsDropped() {
-        var set = QRScannerEngine.DetectionSet()
-        set.add([det("https://example.com", Self.qr, x: 0.1, size: 0.5), det("2Z", Self.micro, x: 0.2)])
-        set.add([det("elsewhere", Self.micro, x: 0.8)])
+        try set.add([det("https://example.com", Self.qr, x: 0.1, size: 0.5), det("2Z", Self.micro, x: 0.2)])
+        try set.add([det("elsewhere", Self.micro, x: 0.8)])
         #expect(set.items.map(\.payload) == ["https://example.com", "elsewhere"])
     }
 
-    @Test func otherSymbologiesFromMutatedViewsAreAcceptedAtOnce() {
+    /// An unwarped rectangle's box (a whole sheet, maybe most of the frame) is not the QR's own,
+    /// so it doesn't hide Micro QRs.
+    @Test func anApproximateQRBoxDropsNothing() throws {
         var set = QRScannerEngine.DetectionSet()
-        let added = set.add([det("https://example.com", Self.qr)], mutated: true)
+        try set.add([det("https://example.com", Self.qr, x: 0, size: 1)], mutated: true, exactBoxes: false)
+        try set.add([det("2Z", Self.micro, x: 0.2)])
+        #expect(set.items.map(\.payload) == ["https://example.com", "2Z"])
+    }
+
+    @Test func otherSymbologiesFromMutatedViewsAreAcceptedAtOnce() throws {
+        var set = QRScannerEngine.DetectionSet()
+        let added = try set.add([det("https://example.com", Self.qr)], mutated: true)
         #expect(added && set.items.count == 1)
+    }
+}
+
+@Suite struct MutatedFrameTests {
+    func box(_ x: Double, _ y: Double, _ w: Double, _ h: Double) -> QRDetection {
+        QRDetection(payload: "p", symbology: "qr", confidence: 1, boundingBox: BoundingBox(x: x, y: y, width: w, height: h))
+    }
+
+    func close(_ a: BoundingBox, _ b: BoundingBox) -> Bool {
+        abs(a.x - b.x) < 1e-9 && abs(a.y - b.y) < 1e-9 && abs(a.width - b.width) < 1e-9 && abs(a.height - b.height) < 1e-9
+    }
+
+    @Test func aScaledFrameHasTheImagesCoordinates() {
+        let d = box(0.1, 0.2, 0.3, 0.4)
+        let m = QRScannerEngine.toImage(d, scale: 2, rotation: 0, frame: CGRect(x: 0, y: 0, width: 200, height: 100),
+                                        width: 100, height: 50)
+        #expect(close(m.boundingBox, d.boundingBox))
+    }
+
+    /// Rotating 100x50 by 90 degrees gives a frame at x -50...0: a box at pixels x 10-20,
+    /// y 5-15 lands at x -15...-5, y 10-20 there.
+    @Test func aRotatedFramesBoxMapsBack() {
+        let d = box(0.7, 0.1, 0.2, 0.1)
+        let m = QRScannerEngine.toImage(d, scale: 1, rotation: 90, frame: CGRect(x: -50, y: 0, width: 50, height: 100),
+                                        width: 100, height: 50)
+        #expect(close(m.boundingBox, BoundingBox(x: 0.1, y: 0.1, width: 0.1, height: 0.2)))
     }
 }
 

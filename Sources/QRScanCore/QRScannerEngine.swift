@@ -165,55 +165,49 @@ public actor QRScannerEngine {
     ///
     /// Vision misreads QR texture as a Micro QR once a damaged or noisy QR is mutated (short
     /// junk payloads like "347" or "2Z": Micro QR has little or no error correction, M1 only
-    /// detects errors). So a Micro QR first seen in a mutated view is tentative: it is accepted
-    /// when a second view reads it too, or when `confirm` reads it again from a close crop of
-    /// the view it was seen in; and a Micro QR lying on a decoded QR is dropped.
+    /// detects errors). So a Micro QR read in a mutated view is accepted only when a close crop
+    /// of that view reads it again (`confirm`), or when a later view reads it too; and a Micro
+    /// QR whose center lies on a decoded QR's exact box is dropped.
     struct DetectionSet {
-        private var accepted: [QRDetection] = []
-        private var tentative: [(detection: QRDetection, evidence: CGImage?)] = []
-        /// Most tentative detections holding evidence at once.
-        static let maxEvidence = 16
+        private var accepted: [(detection: QRDetection, exactBox: Bool)] = []
+        /// Micro QR reads from mutated views that neither a close re-read nor another view has
+        /// confirmed yet.
+        private var tentative: [QRDetection] = []
 
-        /// Adds detections; true when any is new and accepted. `mutated`: they come from a
-        /// mutated or unwarped view, not the raw image. `evidence(i)`: a close crop of the view
-        /// around `dets[i]`, kept for `confirm` if that detection is tentative.
+        /// Adds one view's detections; true when any is new and accepted. `mutated`: the view
+        /// is mutated or unwarped, not the raw image. `exactBoxes`: false when the boxes only
+        /// approximate the codes' bounds (an unwarped rectangle's). `confirm(i)`: whether a
+        /// close re-read of the view confirms `dets[i]`, run when that Micro QR is first seen.
         @discardableResult
-        mutating func add(_ dets: [QRDetection], mutated: Bool = false,
-                          evidence: (Int) -> CGImage? = { _ in nil }) -> Bool {
+        mutating func add(_ dets: [QRDetection], mutated: Bool = false, exactBoxes: Bool = true,
+                          confirm: (Int) throws -> Bool = { _ in false }) throws -> Bool {
             var foundNew = false
-            for (i, d) in dets.enumerated() where !accepted.contains(where: { Self.same($0, d) }) {
+            var thisView: [QRDetection] = []
+            for (i, d) in dets.enumerated() where !accepted.contains(where: { Self.same($0.detection, d) }) {
                 if mutated && Self.isMicroQR(d) {
-                    if let j = tentative.firstIndex(where: { Self.same($0.detection, d) }) {
+                    // A view can't confirm itself (Vision can return one read twice, and every
+                    // read in an unwarped rectangle carries the same box).
+                    if thisView.contains(where: { Self.same($0, d) }) { continue }
+                    thisView.append(d)
+                    if let j = tentative.firstIndex(where: { Self.same($0, d) }) {
                         tentative.remove(at: j)
-                    } else {
-                        // Evidence is up to 4 MB; a long sweep over noisy texture can misread
-                        // hundreds of distinct payloads, so only the first few keep theirs.
-                        let keep = tentative.lazy.filter { $0.evidence != nil }.count < Self.maxEvidence
-                        tentative.append((d, keep ? evidence(i) : nil))
+                    } else if try !confirm(i) {
+                        tentative.append(d)
                         continue
                     }
                 }
-                accepted.append(d)
+                accepted.append((d, exactBoxes))
                 foundNew = true
             }
             return foundNew
         }
 
-        /// Settles the tentative detections: accepts those `reads` reads again from their
-        /// evidence, drops the rest.
-        mutating func confirm(_ reads: (QRDetection, CGImage) throws -> Bool) rethrows {
-            for (d, evidence) in tentative {
-                if let evidence, !accepted.contains(where: { Self.same($0, d) }), try reads(d, evidence) {
-                    accepted.append(d)
-                }
-            }
-            tentative = []
-        }
-
         /// The detections to report.
         var items: [QRDetection] {
-            let qrs = accepted.filter { !Self.isMicroQR($0) && $0.symbology == VNBarcodeSymbology.qr.rawValue }
-            return accepted.filter { d in !(Self.isMicroQR(d) && qrs.contains { Self.centerInside(d, $0) }) }
+            let qrs = accepted.filter { $0.exactBox && $0.detection.symbology == VNBarcodeSymbology.qr.rawValue }
+                .map(\.detection)
+            return accepted.map(\.detection)
+                .filter { d in !(Self.isMicroQR(d) && qrs.contains { Self.centerInside(d, $0) }) }
         }
 
         static func isMicroQR(_ d: QRDetection) -> Bool { d.symbology == VNBarcodeSymbology.microQR.rawValue }
@@ -242,9 +236,9 @@ public actor QRScannerEngine {
         var found = DetectionSet()
 
         // 1. The raw image, whole and in native-resolution tiles. Any hit here skips mutations.
-        found.add(try scanWithVision(image))
+        try found.add(try scanWithVision(image))
         let tiles = try scanTiles(of: image, expired: expired)
-        for dets in tiles.detections { found.add(dets) }
+        for dets in tiles.detections { try found.add(dets) }
         if tiles.expired { return (found.items, 0, true) }
         if !found.items.isEmpty {
             return (found.items, 0, false)
@@ -254,47 +248,73 @@ public actor QRScannerEngine {
         // rectangles), then the brightness/contrast/... mutations — until the deadline. Every
         // view counts as a mutation tried.
         var mutationsTried = 0
-        // Every exit from here settles the tentative Micro QR reads first (unless out of time).
-        func finish(_ exhausted: Bool) throws -> (detections: [QRDetection], mutationsTried: Int, budgetExhausted: Bool) {
-            if !exhausted {
-                try found.confirm { d, evidence in try confirms(d, in: evidence, expired: expired) }
+        // Set when a close re-read was cut short by the deadline: a scan that ends right after
+        // has not done everything it would have.
+        var confirmCut = false
+        func confirm(_ d: QRDetection, in view: CGImage) throws -> Bool {
+            guard let crop = evidenceCrop(of: view, around: d) else { return false }
+            guard let read = try confirms(d, in: crop, expired: expired) else {
+                confirmCut = true
+                return false
             }
-            return (found.items, mutationsTried, exhausted || expired())
+            return read
         }
         for view in perspectiveViews(of: image) {
-            if expired() { return try finish(true) }
+            if expired() { return (found.items, mutationsTried, true) }
             mutationsTried += 1
             let foundNew = try autoreleasepool { () -> Bool in
                 guard let (rendered, box) = view() else { return false }
                 // Boxes in a stretched view are already in the image's normalized coordinates;
                 // in an unwarped rectangle they are reported as that rectangle's bounds.
                 let dets = try scanWithVision(rendered)
-                return found.add(dets.map { d in
+                return try found.add(dets.map { d in
                     box.map { QRDetection(payload: d.payload, symbology: d.symbology,
                                           confidence: d.confidence, boundingBox: $0) } ?? d
-                }, mutated: true, evidence: { evidenceCrop(of: rendered, around: dets[$0]) })
+                }, mutated: true, exactBoxes: box == nil, confirm: { try confirm(dets[$0], in: rendered) })
             }
-            if earlyExit && foundNew { return try finish(false) }
+            if earlyExit && foundNew { return (found.items, mutationsTried, confirmCut) }
         }
         for m in Self.orderedMutations(config, width: image.width, height: image.height) {
-            if expired() { return try finish(true) }
+            if expired() { return (found.items, mutationsTried, true) }
             mutationsTried += 1
             // Each mutation renders a full frame and Vision allocates per request; without a
             // pool per iteration those autoreleased buffers pile up until the sweep ends
             // (gigabytes on a large photo).
             let foundNew = try autoreleasepool { () -> Bool in
-                guard let mutated = applyMutation(to: image,
+                guard let (mutated, extent) = applyMutation(to: image,
                     scale: m.scale, brightness: m.brightness, contrast: m.contrast,
                     blur: m.blur, rotation: m.rotation, sharpen: m.sharpen
                 ) else { return false }
                 let dets = try scanWithVision(mutated)
-                return found.add(dets, mutated: true,
-                                 evidence: { evidenceCrop(of: mutated, around: dets[$0]) })
+                return try found.add(dets.map {
+                    Self.toImage($0, scale: m.scale, rotation: m.rotation, frame: extent,
+                                 width: image.width, height: image.height)
+                }, mutated: true, confirm: { try confirm(dets[$0], in: mutated) })
             }
-            if earlyExit && foundNew { return try finish(false) }
+            if earlyExit && foundNew { return (found.items, mutationsTried, confirmCut) }
         }
 
-        return try finish(false)
+        return (found.items, mutationsTried, confirmCut)
+    }
+
+    /// A detection in a mutated frame (the image scaled by `scale`, then rotated `rotation`
+    /// degrees about the origin; `frame` is that frame's extent, which a rotation moves off the
+    /// origin), mapped to the image's normalized coordinates: the bounds of its box's corners.
+    static func toImage(_ d: QRDetection, scale: Double, rotation: Double, frame: CGRect,
+                        width: Int, height: Int) -> QRDetection {
+        let b = d.boundingBox
+        let t = -rotation * .pi / 180
+        let (c, s) = (cos(t), sin(t))
+        let corners = [(b.x, b.y), (b.x + b.width, b.y), (b.x, b.y + b.height),
+                       (b.x + b.width, b.y + b.height)].map { u, v -> (x: Double, y: Double) in
+            let x = Double(frame.minX) + u * Double(frame.width)
+            let y = Double(frame.minY) + v * Double(frame.height)
+            return ((x * c - y * s) / scale / Double(width), (x * s + y * c) / scale / Double(height))
+        }
+        let (x0, x1) = (corners.map(\.x).min()!, corners.map(\.x).max()!)
+        let (y0, y1) = (corners.map(\.y).min()!, corners.map(\.y).max()!)
+        return QRDetection(payload: d.payload, symbology: d.symbology, confidence: d.confidence,
+                           boundingBox: BoundingBox(x: x0, y: y0, width: x1 - x0, height: y1 - y0))
     }
 
     /// A copy (not a view sharing the frame's buffer) of the region around a detection: its box
@@ -315,13 +335,14 @@ public actor QRScannerEngine {
 
     /// Views a tentative Micro QR's evidence is re-read in: (scale, blur radius). Blurring the
     /// enlarged crop smooths sensor noise out of the small modules.
-    static let confirmViews: [(scale: Double, blur: Double)] = [(1, 0), (2, 0), (3, 0), (2, 1), (3, 2)]
+    static let confirmViews: [(scale: Double, blur: Double)] = [(2, 0), (3, 0), (2, 1), (3, 2)]
 
-    /// Whether Vision reads the tentative Micro QR `d` again from its evidence, close up.
+    /// Whether Vision reads the Micro QR `d` again from its evidence, close up; nil when the
+    /// deadline passed before it could tell.
     private nonisolated func confirms(_ d: QRDetection, in evidence: CGImage,
-                                      expired: () -> Bool) throws -> Bool {
+                                      expired: () -> Bool) throws -> Bool? {
         for v in Self.confirmViews {
-            if expired() { return false }
+            if expired() { return nil }
             let read = try autoreleasepool { () -> Bool in
                 var img = CIImage(cgImage: evidence).transformed(by: CGAffineTransform(scaleX: v.scale, y: v.scale))
                 if v.blur > 0 {
@@ -345,15 +366,15 @@ public actor QRScannerEngine {
     /// Scans the raw image's tiles, several at a time. Detections come back in tile order (so
     /// a scan's result doesn't depend on scheduling), mapped to whole-image coordinates.
     /// `expired`: the deadline passed before every tile was scanned.
-    private nonisolated func scanTiles(of image: CGImage, expired: () -> Bool) throws
-        -> (detections: [[QRDetection]], expired: Bool) {
+    nonisolated func scanTiles(of image: CGImage, workers: Int = tileConcurrency,
+                               expired: () -> Bool) throws -> (detections: [[QRDetection]], expired: Bool) {
         let rects = Self.tileRects(width: image.width, height: image.height)
         guard !rects.isEmpty else { return ([], false) }
         let lock = NSLock()
         var results = [[QRDetection]](repeating: [], count: rects.count)
         var firstError: Error?
         var skipped = false
-        let workers = min(Self.tileConcurrency, rects.count)
+        let workers = max(1, min(workers, rects.count))
         DispatchQueue.concurrentPerform(iterations: workers) { worker in
             for i in stride(from: worker, to: rects.count, by: workers) {
                 lock.lock(); let stop = firstError != nil || skipped; lock.unlock()
@@ -447,7 +468,7 @@ public actor QRScannerEngine {
         to image: CGImage,
         scale: Double, brightness: Double, contrast: Double,
         blur: Double, rotation: Double, sharpen: Double
-    ) -> CGImage? {
+    ) -> (image: CGImage, frame: CGRect)? {
         var ciImage = CIImage(cgImage: image)
 
         if scale != 1.0 {
@@ -482,7 +503,7 @@ public actor QRScannerEngine {
             ])
         }
 
-        return ciContext.createCGImage(ciImage, from: ciImage.extent)
+        return ciContext.createCGImage(ciImage, from: ciImage.extent).map { ($0, ciImage.extent) }
     }
 
     // MARK: - Vision Framework Scan
