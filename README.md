@@ -142,7 +142,8 @@ the mutations look for every symbology). When the raw pass finds nothing, a pers
 runs before the mutations, for codes photographed at a steep angle: the image stretched 2x and
 3x along each axis, then up to 8 rectangles from Vision's rectangle detector unwarped
 (`CIPerspectiveCorrection`) and squared up; each counts as a mutation tried. A code read from an
-unwarped rectangle is reported with that rectangle's bounds. `budgetExhausted: true` means the
+unwarped rectangle is mapped back through the perspective correction and reported where it is
+in the image. `budgetExhausted: true` means the
 scan stopped at its time budget (see below) before trying every mutation.
 
 Vision sometimes misreads the texture of a damaged QR as a Micro QR once it is mutated, with a
