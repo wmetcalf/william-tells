@@ -243,11 +243,10 @@ import zlib
         #expect(added && set.items.map(\.payload) == ["347"])
     }
 
-    /// Vision can return one read twice, and every read in an unwarped rectangle carries the
-    /// rectangle's box: neither is a second view.
+    /// Vision can return one read twice: that is not a second view.
     @Test func aViewCannotConfirmItsOwnRead() throws {
         var set = QRScannerEngine.DetectionSet()
-        try set.add([det("347", Self.micro), det("347", Self.micro)], mutated: true, exactBoxes: false)
+        try set.add([det("347", Self.micro), det("347", Self.micro)], mutated: true)
         #expect(set.items.isEmpty)
     }
 
@@ -258,13 +257,12 @@ import zlib
         #expect(set.items.map(\.payload) == ["https://example.com", "elsewhere"])
     }
 
-    /// An unwarped rectangle's box (a whole sheet, maybe most of the frame) is not the QR's own,
-    /// so it doesn't hide Micro QRs.
-    @Test func anApproximateQRBoxDropsNothing() throws {
+    /// A QR first read in a mutated view hides a Micro QR misread on it, too.
+    @Test func aMicroQRLyingOnAQRFromAMutatedViewIsDropped() throws {
         var set = QRScannerEngine.DetectionSet()
-        try set.add([det("https://example.com", Self.qr, x: 0, size: 1)], mutated: true, exactBoxes: false)
+        try set.add([det("https://example.com", Self.qr, x: 0.1, size: 0.5)], mutated: true)
         try set.add([det("2Z", Self.micro, x: 0.2)])
-        #expect(set.items.map(\.payload) == ["https://example.com", "2Z"])
+        #expect(set.items.map(\.payload) == ["https://example.com"])
     }
 
     @Test func otherSymbologiesFromMutatedViewsAreAcceptedAtOnce() throws {
@@ -301,6 +299,72 @@ import zlib
 }
 
 @Suite struct PerspectiveTests {
+    typealias Quad = QRScannerEngine.Quad
+
+    func near(_ a: Double, _ b: Double, _ tol: Double = 1e-9) -> Bool { abs(a - b) < tol }
+
+    @Test func theUnitSquareMapsOntoTheQuadsCorners() throws {
+        let q = Quad(bottomLeft: CGPoint(x: 0.1, y: 0.2), bottomRight: CGPoint(x: 0.7, y: 0.1),
+                     topRight: CGPoint(x: 0.6, y: 0.9), topLeft: CGPoint(x: 0.2, y: 0.7))
+        let f = try #require(q.fromUnitSquare())
+        for (u, v, p) in [(0.0, 0.0, q.bottomLeft), (1.0, 0.0, q.bottomRight),
+                          (1.0, 1.0, q.topRight), (0.0, 1.0, q.topLeft)] {
+            let m = f(u, v)
+            #expect(near(Double(m.x), Double(p.x)) && near(Double(m.y), Double(p.y)))
+        }
+    }
+
+    @Test func aDegenerateQuadHasNoMap() {
+        let p = CGPoint(x: 0.5, y: 0.5)
+        #expect(Quad(bottomLeft: p, bottomRight: p, topRight: p, topLeft: p).fromUnitSquare() == nil)
+    }
+
+    /// Two codes with one payload on one sheet, the sheet seen at an angle: unwarped, each read
+    /// maps back to where its code is in the image, so both are kept as two codes.
+    @Test func codesInAnUnwarpedSheetKeepTheirOwnPlaces() throws {
+        let message = "https://example.com/\(UUID().uuidString)"
+        let gen = CIFilter(name: "CIQRCodeGenerator")
+        gen?.setValue(Data(message.utf8), forKey: "inputMessage")
+        let qr = try #require(gen?.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)))
+        // A 1000x500 sheet: the codes centered in its left and right halves.
+        var sheet = CIImage(color: .white).cropped(to: CGRect(x: 0, y: 0, width: 1000, height: 500))
+        for cx in [250.0, 750.0] {
+            sheet = qr.transformed(by: CGAffineTransform(translationX: cx - qr.extent.width / 2,
+                                                         y: 250 - qr.extent.height / 2)).composited(over: sheet)
+        }
+        // Onto a 2000x1500 photo, in perspective.
+        let (W, H) = (2000.0, 1500.0)
+        let q = Quad(bottomLeft: CGPoint(x: 0.15, y: 0.2), bottomRight: CGPoint(x: 0.85, y: 0.3),
+                     topRight: CGPoint(x: 0.8, y: 0.7), topLeft: CGPoint(x: 0.2, y: 0.8))
+        func v(_ p: CGPoint) -> CIVector { CIVector(x: p.x * W, y: p.y * H) }
+        let warped = sheet.applyingFilter("CIPerspectiveTransform", parameters: [
+            "inputTopLeft": v(q.topLeft), "inputTopRight": v(q.topRight),
+            "inputBottomLeft": v(q.bottomLeft), "inputBottomRight": v(q.bottomRight)])
+        let photo = warped.composited(over: CIImage(color: .gray).cropped(to: CGRect(x: 0, y: 0, width: W, height: H)))
+            .cropped(to: CGRect(x: 0, y: 0, width: W, height: H))
+        let context = CIContext()
+        let (view, toImage) = try #require(QRScannerEngine.unwarp(photo, quad: q, context: context))
+
+        let request = VNDetectBarcodesRequest()
+        try VNImageRequestHandler(cgImage: view, options: [:]).perform([request])
+        let reads = (request.results ?? []).filter { $0.payloadStringValue == message }.map {
+            toImage(QRDetection(payload: message, symbology: $0.symbology.rawValue, confidence: $0.confidence,
+                                boundingBox: BoundingBox(x: $0.boundingBox.minX, y: $0.boundingBox.minY,
+                                                         width: $0.boundingBox.width, height: $0.boundingBox.height)))
+        }.sorted { $0.boundingBox.x < $1.boundingBox.x }
+        try #require(reads.count == 2)
+        // Where the codes' centers land in the photo.
+        let f = try #require(q.fromUnitSquare())
+        for (read, u) in zip(reads, [0.25, 0.75]) {
+            let c = f(u, 0.5), b = read.boundingBox
+            #expect(near(b.x + b.width / 2, Double(c.x), 0.02) && near(b.y + b.height / 2, Double(c.y), 0.02))
+            #expect(b.width < 0.25)
+        }
+        var set = QRScannerEngine.DetectionSet()
+        try set.add(reads, mutated: true)
+        #expect(set.items.count == 2)
+    }
+
     /// A code squashed to a third of its width (a steep viewing angle): the raw pass misses it,
     /// the perspective pass reads it before any brightness/contrast mutation.
     @Test func aForeshortenedCodeIsReadByStretchingItBack() async throws {

@@ -167,26 +167,25 @@ public actor QRScannerEngine {
     /// junk payloads like "347" or "2Z": Micro QR has little or no error correction, M1 only
     /// detects errors). So a Micro QR read in a mutated view is accepted only when a close crop
     /// of that view reads it again (`confirm`), or when a later view reads it too; and a Micro
-    /// QR whose center lies on a decoded QR's exact box is dropped.
+    /// QR whose center lies on a decoded QR's box is dropped.
     struct DetectionSet {
-        private var accepted: [(detection: QRDetection, exactBox: Bool)] = []
+        private var accepted: [QRDetection] = []
         /// Micro QR reads from mutated views that neither a close re-read nor another view has
         /// confirmed yet.
         private var tentative: [QRDetection] = []
 
-        /// Adds one view's detections; true when any is new and accepted. `mutated`: the view
-        /// is mutated or unwarped, not the raw image. `exactBoxes`: false when the boxes only
-        /// approximate the codes' bounds (an unwarped rectangle's). `confirm(i)`: whether a
-        /// close re-read of the view confirms `dets[i]`, run when that Micro QR is first seen.
+        /// Adds one view's detections, their boxes in the image's normalized coordinates; true
+        /// when any is new and accepted. `mutated`: the view is mutated or unwarped, not the raw
+        /// image. `confirm(i)`: whether a close re-read of the view confirms `dets[i]`, run when
+        /// that Micro QR is first seen.
         @discardableResult
-        mutating func add(_ dets: [QRDetection], mutated: Bool = false, exactBoxes: Bool = true,
+        mutating func add(_ dets: [QRDetection], mutated: Bool = false,
                           confirm: (Int) throws -> Bool = { _ in false }) throws -> Bool {
             var foundNew = false
             var thisView: [QRDetection] = []
-            for (i, d) in dets.enumerated() where !accepted.contains(where: { Self.same($0.detection, d) }) {
+            for (i, d) in dets.enumerated() where !accepted.contains(where: { Self.same($0, d) }) {
                 if mutated && Self.isMicroQR(d) {
-                    // A view can't confirm itself (Vision can return one read twice, and every
-                    // read in an unwarped rectangle carries the same box).
+                    // A view can't confirm itself (Vision can return one read twice).
                     if thisView.contains(where: { Self.same($0, d) }) { continue }
                     thisView.append(d)
                     if let j = tentative.firstIndex(where: { Self.same($0, d) }) {
@@ -196,7 +195,7 @@ public actor QRScannerEngine {
                         continue
                     }
                 }
-                accepted.append((d, exactBoxes))
+                accepted.append(d)
                 foundNew = true
             }
             return foundNew
@@ -204,9 +203,8 @@ public actor QRScannerEngine {
 
         /// The detections to report.
         var items: [QRDetection] {
-            let qrs = accepted.filter { $0.exactBox && $0.detection.symbology == VNBarcodeSymbology.qr.rawValue }
-                .map(\.detection)
-            return accepted.map(\.detection)
+            let qrs = accepted.filter { $0.symbology == VNBarcodeSymbology.qr.rawValue }
+            return accepted
                 .filter { d in !(Self.isMicroQR(d) && qrs.contains { Self.centerInside(d, $0) }) }
         }
 
@@ -263,14 +261,10 @@ public actor QRScannerEngine {
             if expired() { return (found.items, mutationsTried, true) }
             mutationsTried += 1
             let foundNew = try autoreleasepool { () -> Bool in
-                guard let (rendered, box) = view() else { return false }
-                // Boxes in a stretched view are already in the image's normalized coordinates;
-                // in an unwarped rectangle they are reported as that rectangle's bounds.
+                guard let (rendered, toImage) = view() else { return false }
                 let dets = try scanWithVision(rendered)
-                return try found.add(dets.map { d in
-                    box.map { QRDetection(payload: d.payload, symbology: d.symbology,
-                                          confidence: d.confidence, boundingBox: $0) } ?? d
-                }, mutated: true, exactBoxes: box == nil, confirm: { try confirm(dets[$0], in: rendered) })
+                return try found.add(dets.map(toImage), mutated: true,
+                                     confirm: { try confirm(dets[$0], in: rendered) })
             }
             if earlyExit && foundNew { return (found.items, mutationsTried, confirmCut) }
         }
@@ -396,17 +390,18 @@ public actor QRScannerEngine {
     }
 
     /// Renderers for the perspective pass, run one at a time (each inside the caller's pool).
-    /// A renderer returns the view, plus the box to report for its detections when the view's
-    /// coordinates aren't the image's.
-    private func perspectiveViews(of image: CGImage) -> [() -> (CGImage, BoundingBox?)?] {
+    /// A renderer returns the view, plus the mapping of its detections to the image's
+    /// normalized coordinates.
+    private func perspectiveViews(of image: CGImage) -> [() -> (CGImage, (QRDetection) -> QRDetection)?] {
         let source = CIImage(cgImage: image)
         let (w, h) = (Double(image.width), Double(image.height))
-        var views: [() -> (CGImage, BoundingBox?)?] = Self.stretches.map { s in
+        var views: [() -> (CGImage, (QRDetection) -> QRDetection)?] = Self.stretches.map { s in
             { [ciContext] in
-                // Keep the stretched frame inside the working size.
+                // Keep the stretched frame inside the working size. Normalized boxes in a
+                // stretched view are already the image's.
                 let k = min(1, (Double(Self.maxWorkingPixels) / (w * s.x * h * s.y)).squareRoot())
                 let out = source.transformed(by: CGAffineTransform(scaleX: s.x * k, y: s.y * k))
-                return ciContext.createCGImage(out, from: out.extent).map { ($0, nil) }
+                return ciContext.createCGImage(out, from: out.extent).map { ($0, { $0 }) }
             }
         }
         let request = VNDetectRectanglesRequest()
@@ -422,29 +417,87 @@ public actor QRScannerEngine {
         }
         views += rects.map { o in
             { [ciContext] in
-                func px(_ p: CGPoint) -> CIVector { CIVector(x: p.x * w, y: p.y * h) }
-                let flat = source.applyingFilter("CIPerspectiveCorrection", parameters: [
-                    "inputTopLeft": px(o.topLeft), "inputTopRight": px(o.topRight),
-                    "inputBottomLeft": px(o.bottomLeft), "inputBottomRight": px(o.bottomRight)])
-                guard flat.extent.width >= 1, flat.extent.height >= 1 else { return nil }
-                // Square it up (the quad was a square seen at an angle), at a size Vision reads
-                // well, on a white quiet zone.
-                let side = min(Double(Self.unwarpMax), max(Double(Self.unwarpMin),
-                                                           flat.extent.width, flat.extent.height))
-                let pad = 40.0
-                let square = flat
-                    .transformed(by: CGAffineTransform(translationX: -flat.extent.minX, y: -flat.extent.minY))
-                    .transformed(by: CGAffineTransform(scaleX: side / flat.extent.width,
-                                                       y: side / flat.extent.height))
-                    .transformed(by: CGAffineTransform(translationX: pad, y: pad))
-                let page = square.composited(over: CIImage(color: .white)
-                    .cropped(to: CGRect(x: 0, y: 0, width: side + 2 * pad, height: side + 2 * pad)))
-                guard let cg = ciContext.createCGImage(page, from: page.extent) else { return nil }
-                let b = o.boundingBox
-                return (cg, BoundingBox(x: b.minX, y: b.minY, width: b.width, height: b.height))
+                Self.unwarp(source, quad: Quad(bottomLeft: o.bottomLeft, bottomRight: o.bottomRight,
+                                               topRight: o.topRight, topLeft: o.topLeft),
+                            context: ciContext)
             }
         }
         return views
+    }
+
+    /// A quadrilateral in an image's normalized coordinates (bottom-left origin).
+    struct Quad {
+        var bottomLeft, bottomRight, topRight, topLeft: CGPoint
+
+        /// The projective map from the unit square onto the quad ((0,0) to the bottom left,
+        /// (1,1) to the top right), or nil when the quad is degenerate. It is the inverse of
+        /// what CIPerspectiveCorrection does to the quad.
+        func fromUnitSquare() -> ((Double, Double) -> CGPoint)? {
+            let (x0, y0) = (Double(bottomLeft.x), Double(bottomLeft.y))
+            let (x1, y1) = (Double(bottomRight.x), Double(bottomRight.y))
+            let (x2, y2) = (Double(topRight.x), Double(topRight.y))
+            let (x3, y3) = (Double(topLeft.x), Double(topLeft.y))
+            let (dx1, dy1, dx2, dy2) = (x1 - x2, y1 - y2, x3 - x2, y3 - y2)
+            let (dx3, dy3) = (x0 - x1 + x2 - x3, y0 - y1 + y2 - y3)
+            let det = dx1 * dy2 - dx2 * dy1
+            guard abs(det) > 1e-12 else { return nil }
+            let g = (dx3 * dy2 - dx2 * dy3) / det
+            let hh = (dx1 * dy3 - dx3 * dy1) / det
+            let (a, b, c) = (x1 - x0 + g * x1, x3 - x0 + hh * x3, x0)
+            let (d, e, f) = (y1 - y0 + g * y1, y3 - y0 + hh * y3, y0)
+            // A convex quad keeps the denominator positive over the unit square; anything else
+            // isn't a view worth reading.
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] where g * u + hh * v + 1 <= 1e-9 {
+                return nil
+            }
+            return { u, v in
+                let z = g * u + hh * v + 1
+                return CGPoint(x: (a * u + b * v + c) / z, y: (d * u + e * v + f) / z)
+            }
+        }
+    }
+
+    /// The quad's content unwarped (CIPerspectiveCorrection) and squared up at a size Vision
+    /// reads well, on a white quiet zone; plus the mapping of a detection's box in that view
+    /// back to the image's normalized coordinates (the bounds of the code's box projected back
+    /// through the quad). Nil when the quad is degenerate.
+    static func unwarp(_ source: CIImage, quad: Quad, context: CIContext)
+        -> (CGImage, (QRDetection) -> QRDetection)? {
+        guard let project = quad.fromUnitSquare() else { return nil }
+        let (w, h) = (Double(source.extent.width), Double(source.extent.height))
+        func px(_ p: CGPoint) -> CIVector {
+            CIVector(x: source.extent.minX + p.x * w, y: source.extent.minY + p.y * h)
+        }
+        let flat = source.applyingFilter("CIPerspectiveCorrection", parameters: [
+            "inputTopLeft": px(quad.topLeft), "inputTopRight": px(quad.topRight),
+            "inputBottomLeft": px(quad.bottomLeft), "inputBottomRight": px(quad.bottomRight)])
+        guard flat.extent.width >= 1, flat.extent.height >= 1 else { return nil }
+        let side = min(Double(unwarpMax), max(Double(unwarpMin), flat.extent.width, flat.extent.height))
+        let pad = 40.0
+        let square = flat
+            .transformed(by: CGAffineTransform(translationX: -flat.extent.minX, y: -flat.extent.minY))
+            .transformed(by: CGAffineTransform(scaleX: side / flat.extent.width,
+                                               y: side / flat.extent.height))
+            .transformed(by: CGAffineTransform(translationX: pad, y: pad))
+        let page = square.composited(over: CIImage(color: .white)
+            .cropped(to: CGRect(x: 0, y: 0, width: side + 2 * pad, height: side + 2 * pad)))
+        guard let cg = context.createCGImage(page, from: page.extent) else { return nil }
+        let full = side + 2 * pad
+        return (cg, { d in
+            let bb = d.boundingBox
+            // The view's normalized coordinates to the unit square; the quiet zone holds no
+            // code, so a box reaching into it is clamped to the square's edge.
+            func unit(_ t: Double) -> Double { min(1, max(0, (t * full - pad) / side)) }
+            let corners = [(bb.x, bb.y), (bb.x + bb.width, bb.y), (bb.x + bb.width, bb.y + bb.height),
+                           (bb.x, bb.y + bb.height)].map { project(unit($0.0), unit($0.1)) }
+            let xs = corners.map { min(1, max(0, Double($0.x))) }
+            let ys = corners.map { min(1, max(0, Double($0.y))) }
+            let (minX, minY) = (xs.min() ?? 0, ys.min() ?? 0)
+            return QRDetection(payload: d.payload, symbology: d.symbology, confidence: d.confidence,
+                               boundingBox: BoundingBox(x: minX, y: minY,
+                                                        width: (xs.max() ?? 0) - minX,
+                                                        height: (ys.max() ?? 0) - minY))
+        })
     }
 
     /// A detection in a tile, with its box mapped to the whole image's normalized coordinates
