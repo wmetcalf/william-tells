@@ -19,7 +19,7 @@ For hard-to-read QR codes (low contrast, darkened, blurred), the service applies
 ## Requirements
 
 - macOS 13+ (Ventura or later)
-- Swift 5.9+
+- Swift 6.0+ (Xcode 16 or later; the package builds in Swift 6 language mode)
 - Xcode Command Line Tools
 - Apple Silicon recommended (M1/M2 — uses Metal GPU + Neural Engine)
 
