@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "william-tells-blastbox"
-version = "0.2.0"
+version = "0.2.1"
 description = "blastbox engine for William Tells QR Killer: Apple Vision barcode decoding, one sandboxed process per image"
 requires-python = ">=3.12"
 license = { text = "MIT" }
