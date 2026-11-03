@@ -90,8 +90,10 @@ func makeScanBackend(logger: Logger) async throws -> ScanBackend {
         let scannerPath = e["WTQRK_SCAN_BIN"].flatMap { $0.isEmpty ? nil : $0 }
             ?? URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
                 .deletingLastPathComponent().appendingPathComponent("wtqrk-scan").path
-        let scanner = try SandboxedScanner(scanner: URL(fileURLWithPath: scannerPath),
-                                           slotIndices: Array(100..<(100 + slots)))
+        // Provisioning runs codesign per slot.
+        let scanner = try await Blocking.run {
+            try SandboxedScanner(scanner: URL(fileURLWithPath: scannerPath), slotIndices: Array(100..<(100 + slots)))
+        }
         let gate = await scanner.selfTest()
         if gate.ok {
             logger.info("sandboxed scanning: \(gate.detail)")

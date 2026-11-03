@@ -64,15 +64,16 @@ public actor SandboxedScanner {
         var picked: SandboxSlot?
         while picked == nil {
             guard let slot = await checkout() else { return (false, "no clean slot: \(retired)") }
-            if clean(slot) { picked = slot }
+            if await clean(slot) { picked = slot }
         }
         let slot = picked!
         let result = await selfTestIn(slot)
         if result.ok {
-            Container.capture(slot.containerData, to: planCache)
+            let (data, cache) = (slot.containerData, planCache)
+            await Blocking.run { Container.capture(data, to: cache) }
             planCacheReady = true
         }
-        if clean(slot) { release(slot) }
+        if await clean(slot) { release(slot) }
         return result
     }
 
@@ -167,21 +168,24 @@ public actor SandboxedScanner {
                 return .engineError(code: "no_clean_slot",
                                     message: "every sandbox slot was retired: \(retired)")
             }
-            if clean(slot) { picked = slot }
+            if await clean(slot) { picked = slot }
         }
         let slot = picked!
         argv[0] = slot.executable.path
-        if planCacheReady { Container.seed(slot.containerData, from: planCache) }
+        if planCacheReady {
+            let (data, cache) = (slot.containerData, planCache)
+            await Blocking.run { Container.seed(data, from: cache) }
+        }
         let r: RunResult
         do {
             r = try await Self.spawn(argv, in: slot, stdinPath: path, limits: limits)
         } catch {
-            if clean(slot) { release(slot) }
+            if await clean(slot) { release(slot) }
             return .engineError(code: "spawn_failed", message: "\(error)")
         }
         // Clean up BEFORE answering: a slot whose container can't be emptied after this job is
         // retired, and this job's answer is still the scanner's (judged below like any other).
-        if clean(slot) { release(slot) }
+        if await clean(slot) { release(slot) }
         return Self.outcome(r)
     }
 
@@ -220,36 +224,45 @@ public actor SandboxedScanner {
                      limits: RunLimits = RunLimits()) async -> ScanOutcome {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("wtqrk-\(UUID().uuidString)", isDirectory: true)
+        let f = dir.appendingPathComponent("input")
         do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
-                                                    attributes: [.posixPermissions: 0o700])
-            let f = dir.appendingPathComponent("input")
-            try data.write(to: f)
-            defer { try? FileManager.default.removeItem(at: dir) }
-            return await scan(path: f.path, maxBytes: max(data.count, 1), heavy: heavy,
-                              configJSON: configJSON, limits: limits)
+            try await Blocking.run {
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+                try data.write(to: f)
+            }
         } catch {
             try? FileManager.default.removeItem(at: dir)
             return .engineError(code: "spool_failed", message: "\(error)")
         }
+        let outcome = await scan(path: f.path, maxBytes: max(data.count, 1), heavy: heavy,
+                                 configJSON: configJSON, limits: limits)
+        try? FileManager.default.removeItem(at: dir)
+        return outcome
     }
 
     // MARK: slots
 
     /// Kill anything still running from the slot, then empty its container. On failure the slot
     /// is retired (never handed out again) and false is returned; the caller must not release it.
-    private func clean(_ slot: SandboxSlot) -> Bool {
+    private func clean(_ slot: SandboxSlot) async -> Bool {
+        guard let why = await Blocking.run({ Self.scrub(slot) }) else { return true }
+        retire(slot, why: why)
+        return false
+    }
+
+    /// `clean`'s blocking part (the sweeps poll for up to a second each): nil when the slot is
+    /// clean, else why not.
+    static func scrub(_ slot: SandboxSlot) -> String? {
         guard Runner.sweep(container: slot.containerData.path),
               Runner.sweep(executable: slot.executable.path) else {
-            retire(slot, why: "processes in the slot could not all be killed")
-            return false
+            return "processes in the slot could not all be killed"
         }
         do {
             try Container.wipe(slot.containerData)
-            return true
+            return nil
         } catch {
-            retire(slot, why: "\(error)")
-            return false
+            return "\(error)"
         }
     }
 

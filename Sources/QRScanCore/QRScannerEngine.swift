@@ -5,6 +5,7 @@ import CoreImage
 import Metal
 import ImageIO
 import UniformTypeIdentifiers
+import os
 
 // MARK: - Compute preference
 
@@ -29,7 +30,10 @@ public enum ComputeError: Error, LocalizedError {
 
 // MARK: - QR Scanner Engine
 
-public actor QRScannerEngine {
+/// Holds no mutable state, so one engine can run several scans at once. A scan is synchronous
+/// Vision and Core Image work that can take minutes; `scan` runs it on a GCD thread, never on the
+/// Swift concurrency pool, whose few threads a long-lived service needs for everything else.
+public final class QRScannerEngine: Sendable {
 
     private let ciContext: CIContext
     private let metalDevice: MTLDevice?
@@ -56,6 +60,23 @@ public actor QRScannerEngine {
     /// timeout, so a long sweep ends with its partial result instead of being killed with nothing.
     public func scan(imageData: Data, config: MutationConfig, earlyExit: Bool = false,
                      deadline: Date? = nil) async throws -> ScanReport {
+        try await withCheckedThrowingContinuation { cont in
+            Self.scanQueue.async {
+                cont.resume(with: Result {
+                    try self.scanBlocking(imageData: imageData, config: config, earlyExit: earlyExit,
+                                          deadline: deadline)
+                })
+            }
+        }
+    }
+
+    /// Where scans run: GCD can add threads when these block, which the concurrency pool can't.
+    private static let scanQueue = DispatchQueue(label: "wtqrk.scan", qos: .userInitiated,
+                                                 attributes: .concurrent)
+
+    /// `scan`, on the calling thread.
+    func scanBlocking(imageData: Data, config: MutationConfig, earlyExit: Bool = false,
+                      deadline: Date? = nil) throws -> ScanReport {
         let cgImage = try Self.loadImage(from: imageData)
 
         let dimensions = ImageDimensions(
@@ -230,7 +251,7 @@ public actor QRScannerEngine {
         earlyExit: Bool,
         deadline: Date?
     ) throws -> (detections: [QRDetection], mutationsTried: Int, budgetExhausted: Bool) {
-        func expired() -> Bool { deadline.map { Date() >= $0 } ?? false }
+        @Sendable func expired() -> Bool { deadline.map { Date() >= $0 } ?? false }
         var found = DetectionSet()
 
         // 1. The raw image, whole and in native-resolution tiles. Any hit here skips mutations.
@@ -313,7 +334,7 @@ public actor QRScannerEngine {
 
     /// A copy (not a view sharing the frame's buffer) of the region around a detection: its box
     /// grown by half its size on every side, at most 1024 px on the long side.
-    private nonisolated func evidenceCrop(of view: CGImage, around d: QRDetection) -> CGImage? {
+    private func evidenceCrop(of view: CGImage, around d: QRDetection) -> CGImage? {
         let (w, h) = (Double(view.width), Double(view.height))
         let b = d.boundingBox
         let r = CGRect(x: (b.x - b.width / 2) * w, y: (b.y - b.height / 2) * h,
@@ -333,7 +354,7 @@ public actor QRScannerEngine {
 
     /// Whether Vision reads the Micro QR `d` again from its evidence, close up; nil when the
     /// deadline passed before it could tell.
-    private nonisolated func confirms(_ d: QRDetection, in evidence: CGImage,
+    private func confirms(_ d: QRDetection, in evidence: CGImage,
                                       expired: () -> Bool) throws -> Bool? {
         for v in Self.confirmViews {
             if expired() { return nil }
@@ -360,33 +381,36 @@ public actor QRScannerEngine {
     /// Scans the raw image's tiles, several at a time. Detections come back in tile order (so
     /// a scan's result doesn't depend on scheduling), mapped to whole-image coordinates.
     /// `expired`: the deadline passed before every tile was scanned.
-    nonisolated func scanTiles(of image: CGImage, workers: Int = tileConcurrency,
-                               expired: () -> Bool) throws -> (detections: [[QRDetection]], expired: Bool) {
+    func scanTiles(of image: CGImage, workers: Int = tileConcurrency,
+                   expired: @Sendable () -> Bool) throws -> (detections: [[QRDetection]], expired: Bool) {
         let rects = Self.tileRects(width: image.width, height: image.height)
         guard !rects.isEmpty else { return ([], false) }
-        let lock = NSLock()
-        var results = [[QRDetection]](repeating: [], count: rects.count)
-        var firstError: Error?
-        var skipped = false
+        struct Shared: Sendable {
+            var results: [[QRDetection]]
+            var firstError: Error?
+            var skipped = false
+        }
+        let shared = OSAllocatedUnfairLock(initialState: Shared(
+            results: [[QRDetection]](repeating: [], count: rects.count)))
         let workers = max(1, min(workers, rects.count))
         DispatchQueue.concurrentPerform(iterations: workers) { worker in
             for i in stride(from: worker, to: rects.count, by: workers) {
-                lock.lock(); let stop = firstError != nil || skipped; lock.unlock()
-                if stop { return }
-                if expired() { lock.lock(); skipped = true; lock.unlock(); return }
+                if shared.withLock({ $0.firstError != nil || $0.skipped }) { return }
+                if expired() { shared.withLock { $0.skipped = true }; return }
                 guard let tile = image.cropping(to: rects[i]) else { continue }
                 do {
                     let dets = try scanWithVision(tile, symbologies: Self.tileSymbologies)
                         .map { Self.toFullImage($0, tile: rects[i], of: image) }
-                    lock.lock(); results[i] = dets; lock.unlock()
+                    shared.withLock { $0.results[i] = dets }
                 } catch {
-                    lock.lock(); if firstError == nil { firstError = error }; lock.unlock()
+                    shared.withLock { if $0.firstError == nil { $0.firstError = error } }
                     return
                 }
             }
         }
-        if let firstError { throw firstError }
-        return (results, skipped)
+        let done = shared.withLock { $0 }
+        if let firstError = done.firstError { throw firstError }
+        return (done.results, done.skipped)
     }
 
     /// Renderers for the perspective pass, run one at a time (each inside the caller's pool).
@@ -571,12 +595,12 @@ public actor QRScannerEngine {
     /// whole frame and every mutation still look for all of them.
     static let tileSymbologies: [VNBarcodeSymbology] = [.qr, .microQR]
 
-    private nonisolated func scanWithVision(_ image: CGImage,
+    private func scanWithVision(_ image: CGImage,
                                 symbologies: [VNBarcodeSymbology] = allSymbologies) throws -> [QRDetection] {
         try autoreleasepool { try scanWithVisionUnpooled(image, symbologies: symbologies) }
     }
 
-    private nonisolated func scanWithVisionUnpooled(_ image: CGImage, symbologies: [VNBarcodeSymbology]) throws -> [QRDetection] {
+    private func scanWithVisionUnpooled(_ image: CGImage, symbologies: [VNBarcodeSymbology]) throws -> [QRDetection] {
         var detections: [QRDetection] = []
         var scanError: Error?
 
@@ -626,7 +650,7 @@ public actor QRScannerEngine {
         return detections
     }
 
-    private nonisolated func applyComputePreference(to request: VNDetectBarcodesRequest) throws {
+    private func applyComputePreference(to request: VNDetectBarcodesRequest) throws {
         guard compute != .auto else { return }
         guard #available(macOS 14.0, *) else { throw ComputeError.unavailable(compute) }
         let devices = try request.supportedComputeStageDevices[.main] ?? []

@@ -115,6 +115,31 @@ import zlib
     }
 }
 
+/// A scan is minutes of synchronous Vision work; it must not hold one of the Swift concurrency
+/// pool's threads (one per core), or a service running a few at once stops answering anything.
+@Suite struct ScanThreadTests {
+    @Test func scansDoNotStarveTheConcurrencyPool() async throws {
+        let png = try #require(blankPNG(width: 1500, height: 1500))
+        // One engine per scan, as the service's pool has.
+        let scans = ProcessInfo.processInfo.activeProcessorCount + 2
+        let start = Date()
+        let deadline = start.addingTimeInterval(3)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<scans {
+                group.addTask {
+                    _ = try await QRScannerEngine().scan(imageData: png, config: .heavy, earlyExit: false, deadline: deadline)
+                }
+            }
+            // Give every scan time to start, then run a trivial task on the pool. Timed from the
+            // start: on a starved pool even the sleep can't wake until the scans end (3 s).
+            try await Task.sleep(for: .milliseconds(500))
+            _ = await Task.detached { 1 }.value
+            #expect(Date().timeIntervalSince(start) < 1.5)
+            try await group.waitForAll()
+        }
+    }
+}
+
 @Suite struct MutationOrderTests {
     @Test func heavyTriesTheDefaultMutationsFirst() {
         let order = QRScannerEngine.orderedMutations(.heavy, width: 500, height: 500)
