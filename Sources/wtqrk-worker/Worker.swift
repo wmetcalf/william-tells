@@ -76,7 +76,10 @@ enum WTQRKWorker {
             ?? URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
                 .deletingLastPathComponent().appendingPathComponent("wtqrk-scan").path
         let slot = Int(e["WTQRK_WORKER_SLOT"] ?? "") ?? 0
-        let scanner = try SandboxedScanner(scanner: URL(fileURLWithPath: scannerPath), slotIndices: [slot])
+        // Provisioning runs codesign.
+        let scanner = try await Blocking.run {
+            try SandboxedScanner(scanner: URL(fileURLWithPath: scannerPath), slotIndices: [slot])
+        }
         let gate = await scanner.selfTest()
         if gate.ok {
             app.logger.info("wtqrk self-test passed: \(gate.detail)")
@@ -189,8 +192,10 @@ final class Agent: Sendable {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
                                                     attributes: [.posixPermissions: 0o700])
             let input = dir.appendingPathComponent("input")
-            try body.write(to: input)
-            let sha = try BlastboxEnvelope.sha256(fileAt: input.path)
+            let sha = try await Blocking.run {
+                try body.write(to: input)
+                return try BlastboxEnvelope.sha256(fileAt: input.path)
+            }
 
             let outcome = await run(inputPath: input.path, params: params)
             let meta = try BlastboxEnvelope.metadataJSON(

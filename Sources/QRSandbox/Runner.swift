@@ -232,9 +232,14 @@ public enum Runner {
         return listPids(type: UInt32(PROC_ALL_PIDS), arg: 0).allSatisfy { $0 == me || !matches($0) }
     }
 
+    /// A NUL-terminated C buffer as a String.
+    static func string(_ buf: [CChar]) -> String {
+        String(decoding: buf.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
     static func containerPath(_ pid: pid_t) -> String? {
         var buf = [CChar](repeating: 0, count: 4096)
-        return sandbox_container_path_for_pid(pid, &buf, buf.count) == 0 ? String(cString: buf) : nil
+        return sandbox_container_path_for_pid(pid, &buf, buf.count) == 0 ? string(buf) : nil
     }
 
     static func canonical(_ path: String) -> String {
@@ -263,7 +268,7 @@ public enum Runner {
 
     static func pidPath(_ pid: pid_t) -> String? {
         var buf = [CChar](repeating: 0, count: 4096)
-        return proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 ? String(cString: buf) : nil
+        return proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 ? string(buf) : nil
     }
 
     static func footprint(_ pid: pid_t) -> UInt64 {
