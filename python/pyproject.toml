@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "william-tells-blastbox"
-version = "0.1.0"
+version = "0.2.0"
 description = "blastbox engine for William Tells QR Killer: Apple Vision barcode decoding, one sandboxed process per image"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 # [host]: the ingress extension (FastAPI, blastbox.host) and `blastbox serve`/`dispatch`.
-dependencies = ["blastbox[host]>=0.1.45"]
+dependencies = ["blastbox[host]>=0.1.48"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5"]
