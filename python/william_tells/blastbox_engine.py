@@ -129,14 +129,13 @@ def _bounded_int(text: str) -> int:
 
 
 def _depth(doc: Any) -> int:
-    deepest, stack = 0, [(doc, 1)]
-    while stack:
-        node, d = stack.pop()
-        if isinstance(node, (dict, list)):
-            deepest = max(deepest, d)
-            stack.extend((c, d + 1) for c in (node.values() if isinstance(node, dict) else node)
-                         if isinstance(c, (dict, list)))
-    return deepest
+    """Container nesting depth, level by level, stopping once past the limit."""
+    depth, level = 0, [doc] if isinstance(doc, (dict, list)) else []
+    while level and depth <= _MAX_JSON_DEPTH:
+        depth += 1
+        level = [c for n in level for c in (n.values() if isinstance(n, dict) else n)
+                 if isinstance(c, (dict, list))]
+    return depth
 
 
 def _finite_float(text: str) -> float:

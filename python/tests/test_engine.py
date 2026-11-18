@@ -534,6 +534,17 @@ class TestHostileScannerShapesMatchTheNativeAgent:
         assert wt._strict_json("[" * 512 + "]" * 512) is not None
         with pytest.raises(ValueError):
             wt._strict_json("[" * 513 + "]" * 513)
+        assert wt._strict_json('{"a":' * 511 + "1" + "}" * 511) is not None
+        assert wt._strict_json('{"a":' * 512 + "1" + "}" * 512) is not None
+        with pytest.raises(ValueError):
+            wt._strict_json('{"a":' * 513 + "1" + "}" * 513)
+
+    def test_a_309_digit_integer_past_a_double_is_refused(self):
+        # Both 309 digits: the length guard passes them; float() decides.
+        top = 2**1024 - 2**970        # rounds to infinity
+        assert wt._strict_json(str(top - 1)) == top - 1
+        with pytest.raises(ValueError):
+            wt._strict_json(str(top))
 
     def test_a_huge_integer_in_the_config_is_bad_config(self, tmp_path, monkeypatch):
         monkeypatch.setenv("WTQRK_CONFIG", '{"scales": [1' + "0" * 400 + ']}')

@@ -43,7 +43,7 @@ required_root_fields = ["schema", "mode", "compute", "image_width", "image_heigh
 code = "qr_code_decoded"
 severity = "low"
 source = "payload.fields.payloads[] (one decoded string per barcode, at most 256, each at most 4096 chars; per-barcode symbology/confidence/bbox in payload.fields.detections.<i>)"
-description = "A barcode/QR decoded from the image. The output carries the decoded text only. Loadout raises qr_code_decoded at low severity, or medium when a payload is an http(s) URL; the engine itself neither codes nor classifies the payload."
+description = "A barcode/QR decoded from the image. The output carries the decoded text only. Loadout raises qr_code_decoded at severity 20, or 40 when a payload is an http(s) URL (on its own word scale low is 30 and medium 50, so both sit just below those words); the engine itself neither codes nor classifies the payload."
 
 [[gaps]]
 id = "no-finding-code"
