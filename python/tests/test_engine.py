@@ -516,14 +516,19 @@ class TestHostileScannerShapesMatchTheNativeAgent:
         assert res.status == "engine_error" and res.warnings[0].code == "bad_scanner_output"
 
     @pytest.mark.parametrize("n", ["9223372036854775807", "-9223372036854775808",
-                                   "18446744073709551615"])
-    def test_integers_foundation_holds_are_accepted(self, n):
+                                   "18446744073709551616", "1" + "0" * 308])
+    def test_integers_finite_as_a_double_are_accepted(self, n):
+        # Foundation's JSONSerialization parses these too.
         assert wt._strict_json('{"x": ' + n + '}') == {"x": int(n)}
 
-    @pytest.mark.parametrize("n", ["18446744073709551616", "-9223372036854775809"])
-    def test_integers_past_64_bits_are_refused(self, n):
+    @pytest.mark.parametrize("n", ["1" + "0" * 309, "-1" + "0" * 309])
+    def test_integers_past_a_double_are_refused(self, n):
         with pytest.raises(ValueError):
             wt._strict_json('{"x": ' + n + '}')
+
+    def test_a_19_digit_config_value_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("WTQRK_CONFIG", '{"rotationDegrees": [1000000000000000000]}')
+        assert wt._bad_params() is None
 
     def test_nesting_past_foundations_limit_is_refused(self):
         assert wt._strict_json("[" * 512 + "]" * 512) is not None
