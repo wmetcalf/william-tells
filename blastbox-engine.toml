@@ -38,10 +38,12 @@ required_root_fields = ["schema", "mode", "compute", "image_width", "image_heigh
                         "payloads", "detections"]
 
 [[detections]]
-code = "williamtells.qr_decoded"
+# The engine emits no code (gap no-finding-code); this is the code its consumer raises, so a
+# rule written against the contract matches what Loadout produces.
+code = "qr_code_decoded"
 severity = "low"
 source = "payload.fields.payloads[] (one decoded string per barcode, at most 256, each at most 4096 chars; per-barcode symbology/confidence/bbox in payload.fields.detections.<i>)"
-description = "A barcode/QR decoded from the image. The output carries the decoded text only; it has no per-finding code and does not classify the payload (URL vs text)."
+description = "A barcode/QR decoded from the image. The output carries the decoded text only. Loadout raises qr_code_decoded at low severity, or medium when a payload is an http(s) URL; the engine itself neither codes nor classifies the payload."
 
 [[gaps]]
 id = "no-finding-code"
