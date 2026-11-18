@@ -18,6 +18,7 @@ import pytest
 from blastbox.contract import Record
 from blastbox.limits import Limits
 from blastbox.worker.sandbox.base import SandboxResult
+from conftest import conform
 
 from william_tells import blastbox_engine as wt
 from william_tells.blastbox_engine import WilliamTellsEngine, parse_scan_output, sniff
@@ -279,8 +280,9 @@ def _sealed_run(engine, input_path: Path, tmp_path: Path):
     limits = Limits(timeout_s=120)
     assert run_detonation(engine, input_path=input_path, output_dir=out, limits=limits) == 0
     sha = hashlib.sha256(input_path.read_bytes()).hexdigest()
-    return validate_worker_output(output_dir=out, input_sha256=sha, engine=engine.name,
-                                  limits=limits)
+    env = validate_worker_output(output_dir=out, input_sha256=sha, engine=engine.name,
+                                 limits=limits)
+    return conform(env)
 
 
 @needs_real

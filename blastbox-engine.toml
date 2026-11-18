@@ -1,0 +1,67 @@
+# Engine output contract for `williamtells` (schema blastbox-engine-contract/1).
+# Describes what python/william_tells/blastbox_engine.py and the native Swift agent
+# (Sources/QRSandbox/BlastboxEnvelope.swift) emit TODAY; both produce the same envelope.
+# Validate: python -m blastbox.contract.engine_contract validate blastbox-engine.toml
+schema = "blastbox-engine-contract/1"
+
+[engine]
+name = "williamtells"
+formats = ["png", "jpeg", "heic", "heif", "webp", "tiff", "gif", "bmp", "svg", "pdf"]
+network = ["none"]
+# No fixed cap in the engine: limits.max_input_bytes is forwarded to wtqrk-scan (--max-bytes).
+statuses = ["ok", "rejected", "engine_error"]
+
+# No [[artifacts]]: the engine writes nothing under outdir; every result is payload-only.
+
+[payload]
+# ok: Record{schema, mode, compute, image_width, image_height, mutations_tried,
+#     budget_exhausted, detection_count, payloads[], detections: Record{"0": Record{payload,
+#     symbology, confidence, bbox_x, bbox_y, bbox_w, bbox_h}, ...}}
+# rejected / engine_error: Record{schema, error} plus one warning with the same code.
+root = "record"
+node_types = ["record"]
+schema_field = "schema"
+schema_version = "wtqrk.scan/1"
+required_root_fields = ["schema", "mode", "compute", "image_width", "image_height",
+                        "mutations_tried", "budget_exhausted", "detection_count", "payloads",
+                        "detections"]
+
+[[detections]]
+code = "williamtells.qr_decoded"
+severity = "low"
+source = "payload.fields.payloads[] (one decoded string per barcode, at most 256, each at most 4096 chars; per-barcode symbology/confidence/bbox in payload.fields.detections.<i>)"
+description = "A barcode/QR decoded from the image. The output carries the decoded text only; it has no per-finding code and does not classify the payload (URL vs text)."
+
+[[gaps]]
+id = "no-finding-code"
+description = "Decoded barcodes are bare strings in payloads[]: no stable finding code, no URL/text classification, no severity. The consumer decides all three (Loadout synthesizes qr_code_decoded and its own http(s) test)."
+
+[[gaps]]
+id = "truncation-only-in-warnings"
+description = "Over 256 barcodes keeps 256 and a payload over 4096 chars is cut to 4096; detection_count is the KEPT count, so the cut is visible only as warnings detections_truncated / payload_truncated, not in the payload."
+
+[[gaps]]
+id = "partial-sweep-is-ok"
+description = "A scan that ran out of time budget is status ok with budget_exhausted=true and warning scan_budget_exhausted; an empty payloads[] then is not a full sweep and must not be read as 'no QR'."
+
+[[gaps]]
+id = "detections-keyed-record"
+description = "Per-barcode detail is a Record keyed by decimal strings (\"0\", \"1\", ...) rather than a list; payloads[i] and detections.<i> correspond only by index."
+
+[[gaps]]
+id = "loadout-ignores-budget-and-truncation"
+description = "Loadout's williamtells_scan_evidence marks a scan complete without reading budget_exhausted or the warnings, and its 'detection_count > payloads' / '> 4096 chars' checks cannot fire on engine-side truncation (count is post-cut, payloads are cut to exactly 4096). A partial or truncated scan is reported as complete coverage."
+
+[[gaps]]
+id = "loadout-ignores-structured-detections"
+description = "Loadout reads only payloads[]; symbology, confidence, bounding boxes, mode, compute and mutations_tried are not mapped."
+
+[[gaps]]
+id = "loadout-skips-pdf-svg"
+description = "The engine accepts pdf and svg, but Loadout's manifest accept_mime / routing rules (WT_IMAGE_MIMES) cover only raster images, so PDFs and SVGs are never routed to it."
+
+[[consumers]]
+name = "loadout"
+engine = "williamtells"
+mapper = "backend/loadout/engines.py:williamtells_results"
+emits = ["url", "qr_code", "detection"]
