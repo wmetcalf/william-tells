@@ -515,6 +515,21 @@ class TestHostileScannerShapesMatchTheNativeAgent:
         res = eng.detonate(_input(tmp_path), tmp_path, Limits())
         assert res.status == "engine_error" and res.warnings[0].code == "bad_scanner_output"
 
+    @pytest.mark.parametrize("n", ["9223372036854775807", "-9223372036854775808",
+                                   "18446744073709551615"])
+    def test_integers_foundation_holds_are_accepted(self, n):
+        assert wt._strict_json('{"x": ' + n + '}') == {"x": int(n)}
+
+    @pytest.mark.parametrize("n", ["18446744073709551616", "-9223372036854775809"])
+    def test_integers_past_64_bits_are_refused(self, n):
+        with pytest.raises(ValueError):
+            wt._strict_json('{"x": ' + n + '}')
+
+    def test_nesting_past_foundations_limit_is_refused(self):
+        assert wt._strict_json("[" * 512 + "]" * 512) is not None
+        with pytest.raises(ValueError):
+            wt._strict_json("[" * 513 + "]" * 513)
+
     def test_a_huge_integer_in_the_config_is_bad_config(self, tmp_path, monkeypatch):
         monkeypatch.setenv("WTQRK_CONFIG", '{"scales": [1' + "0" * 400 + ']}')
         eng, _ = _engine(tmp_path, _ok_doc([]))

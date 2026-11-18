@@ -111,10 +111,29 @@ def _no_constant(name: str) -> Any:
     raise ValueError(f"non-finite number {name}")
 
 
+# NSNumber holds Int64 and UInt64; Foundation's JSONSerialization refuses integers past that.
+_INT_MIN, _INT_MAX = -(2**63), 2**64 - 1
+# Foundation's JSONSerialization refuses nesting deeper than this.
+_MAX_JSON_DEPTH = 512
+
+
 def _bounded_int(text: str) -> int:
-    if len(text.lstrip("-")) > 18:
+    if len(text.lstrip("-")) > 20:
         raise ValueError("integer too large")
-    return int(text)
+    v = int(text)
+    if not _INT_MIN <= v <= _INT_MAX:
+        raise ValueError("integer too large")
+    return v
+
+
+def _depth(doc: Any) -> int:
+    deepest, stack = 0, [(doc, 1)]
+    while stack:
+        node, d = stack.pop()
+        if isinstance(node, (dict, list)):
+            deepest = max(deepest, d)
+            stack.extend((c, d + 1) for c in (node.values() if isinstance(node, dict) else node))
+    return deepest
 
 
 def _finite_float(text: str) -> float:
@@ -134,6 +153,8 @@ def _strict_json(raw: str | bytes) -> Any:
         json.dumps(doc, ensure_ascii=False).encode("utf-8")
     except (RecursionError, UnicodeEncodeError) as exc:
         raise ValueError(f"unacceptable JSON ({type(exc).__name__})") from None
+    if _depth(doc) > _MAX_JSON_DEPTH:
+        raise ValueError(f"JSON nested deeper than {_MAX_JSON_DEPTH}")
     return doc
 
 
