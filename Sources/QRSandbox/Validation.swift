@@ -88,7 +88,7 @@ public enum ScanOutputValidator {
         for item in raw.prefix(maxDetections) {
             guard let d = item as? [String: Any] else { throw OutputError("detection must be an object") }
             guard let payload = d["payload"] as? String else { throw OutputError("payload must be a string") }
-            if payload.count > maxPayloadChars {
+            if overLimit(payload, maxPayloadChars) {
                 warnings.append(ScanWarning(code: "payload_truncated",
                                             message: "a payload was cut to \(maxPayloadChars) chars"))
             }
@@ -100,7 +100,7 @@ public enum ScanOutputValidator {
                 confidence: try num(d["confidence"], 0, 1),
                 bboxX: try num(bb["x"], -10, 10), bboxY: try num(bb["y"], -10, 10),
                 bboxW: try num(bb["width"], 0, 10), bboxH: try num(bb["height"], 0, 10),
-                payloadTruncated: payload.count > maxPayloadChars))
+                payloadTruncated: overLimit(payload, maxPayloadChars)))
         }
         guard let mode = doc["mode"] as? String, let compute = doc["compute"] as? String else {
             throw OutputError("mode/compute must be strings")
@@ -151,7 +151,14 @@ public enum ScanOutputValidator {
         return i
     }
 
-    static func clip(_ s: String, _ n: Int) -> String { s.count > n ? String(s.prefix(n)) : s }
+    /// Cut `s` to `n` Unicode scalars (code points), the unit the Python engine's `len` counts, so
+    /// both agents cut, and flag, the same payload. `String.count` counts grapheme clusters, and one
+    /// cluster can hold any number of scalars (CR LF, combining marks).
+    static func clip(_ s: String, _ n: Int) -> String {
+        s.unicodeScalars.count > n ? String(String.UnicodeScalarView(s.unicodeScalars.prefix(n))) : s
+    }
+
+    static func overLimit(_ s: String, _ n: Int) -> Bool { s.unicodeScalars.count > n }
 
     /// Strict `WTQRK_CONFIG`: an object of known keys, each a list of at most 10 finite numbers.
     /// Returns canonical JSON for the scanner's `--config-json`.

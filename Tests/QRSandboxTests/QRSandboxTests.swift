@@ -101,7 +101,7 @@ import QRScanCore
         #expect(scan.detections[0].payload.count == ScanOutputValidator.maxPayloadChars)
         #expect(Set(warnings.map(\.code)) == ["detections_truncated", "payload_truncated"])
         #expect(scan.found == 300 && scan.detectionsTruncated && scan.payloadsTruncated)
-        #expect(scan.detections.allSatisfy(\.payloadTruncated))
+        #expect(scan.detections.allSatisfy { $0.payloadTruncated })
     }
 
     @Test func anUncutScanIsNotTruncated() throws {
@@ -109,6 +109,18 @@ import QRScanCore
             Issue.record("expected ok"); return
         }
         #expect(scan.found == 1 && !scan.detectionsTruncated && !scan.payloadsTruncated)
+    }
+
+    @Test func payloadLimitCountsCodePointsLikeThePythonEngine() throws {
+        // 2,100 CR LF pairs: 4,200 code points, but only 2,100 grapheme clusters.
+        let crlf = String(repeating: "\\r\\n", count: 2100)
+        let det = #"{"payload":"\#(crlf)","symbology":"QR","confidence":1,"boundingBox":{"x":0,"y":0,"width":1,"height":1}}"#
+        guard case .ok(let scan, let warnings) = try ScanOutputValidator.parse(doc("[" + det + "]")) else {
+            Issue.record("expected ok"); return
+        }
+        #expect(scan.detections[0].payload.unicodeScalars.count == ScanOutputValidator.maxPayloadChars)
+        #expect(scan.payloadsTruncated)
+        #expect(warnings.map(\.code) == ["payload_truncated"])
     }
 
     @Test func configIsStrict() throws {

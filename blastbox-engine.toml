@@ -50,11 +50,11 @@ description = "Per-barcode detail is a Record keyed by decimal strings (\"0\", \
 
 [[gaps]]
 id = "loadout-ignores-budget-and-truncation"
-description = "Loadout's williamtells_scan_evidence marks a scan complete without reading budget_exhausted, detections_truncated / payloads_truncated (or detections_found vs detection_count) or the warnings; its own 'detection_count > payloads' / '> 4096 chars' checks cannot fire on engine-side truncation. A partial or truncated scan is reported as complete coverage. The engine emits every field Loadout needs to fix this."
+description = "Loadout's williamtells_scan_evidence on its released bases marks a scan complete without reading budget_exhausted, detections_truncated / payloads_truncated (or detections_found vs detection_count) or the warnings, so a partial or truncated scan is reported as complete coverage. Fixed on Loadout's feat/engine-contract branch (89464569, 'read wtqrk 5e3457a's truncation, budget and per-barcode records'); this gap closes when that lands."
 
 [[gaps]]
 id = "loadout-ignores-structured-detections"
-description = "Loadout reads only payloads[]; symbology, confidence, bounding boxes, mode, compute and mutations_tried are not mapped."
+description = "Loadout's released mapper reads only payloads[]; symbology, confidence, bounding boxes, mode, compute and mutations_tried are not mapped. Fixed on Loadout's feat/engine-contract branch (89464569: per-barcode symbology/confidence/bbox on each artifact, scan measurements); this gap closes when that lands."
 
 [[gaps]]
 id = "loadout-skips-pdf-svg"
