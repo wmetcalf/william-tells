@@ -71,6 +71,7 @@ public enum BlastboxEnvelope {
                 dets[String(i)] = ["_type": "record", "fields": [
                     "payload": d.payload, "symbology": d.symbology, "confidence": d.confidence,
                     "bbox_x": d.bboxX, "bbox_y": d.bboxY, "bbox_w": d.bboxW, "bbox_h": d.bboxH,
+                    "payload_truncated": d.payloadTruncated,
                 ] as [String: Any]]
             }
             return env(status: "ok", fields: [
@@ -78,6 +79,8 @@ public enum BlastboxEnvelope {
                 "image_width": scan.imageWidth, "image_height": scan.imageHeight,
                 "mutations_tried": scan.mutationsTried, "detection_count": scan.detections.count,
                 "budget_exhausted": scan.budgetExhausted,
+                "detections_found": scan.found, "detections_truncated": scan.detectionsTruncated,
+                "payloads_truncated": scan.payloadsTruncated,
                 "payloads": scan.detections.map(\.payload),
                 "detections": ["_type": "record", "fields": dets],
             ], warnings: warnings)

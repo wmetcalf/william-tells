@@ -177,6 +177,7 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
         warnings.append(Warning(code="detections_truncated",
                                 message=f"kept {MAX_DETECTIONS} of {len(raw_dets)} detections"))
     dets = []
+    payloads_cut = False
     for d in raw_dets[:MAX_DETECTIONS]:
         if not isinstance(d, dict):
             raise ValueError("detection must be an object")
@@ -184,6 +185,7 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
         if cut:
             warnings.append(Warning(code="payload_truncated",
                                     message=f"a payload was cut to {MAX_PAYLOAD_CHARS} chars"))
+        payloads_cut = payloads_cut or cut
         bb = d.get("boundingBox")
         if not isinstance(bb, dict):
             raise ValueError("boundingBox must be an object")
@@ -197,6 +199,7 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
             "bbox_y": _num(bb.get("y"), -10.0, 10.0),
             "bbox_w": _num(bb.get("width"), 0.0, 10.0),
             "bbox_h": _num(bb.get("height"), 0.0, 10.0),
+            "payload_truncated": cut,
         })
     exhausted = report.get("budgetExhausted", False)
     if exhausted is None:
@@ -215,6 +218,11 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
         "image_height": _int(dims.get("height"), 1, 1 << 20),
         "mutations_tried": _int(report.get("mutationsTried"), 0, MAX_MUTATIONS_TRIED),
         "budget_exhausted": exhausted,
+        # The cuts above, in the result itself rather than only in warnings: detection_count
+        # is the KEPT count, so a consumer needs the found count to see a truncated scan.
+        "detections_found": len(raw_dets),
+        "detections_truncated": len(raw_dets) > MAX_DETECTIONS,
+        "payloads_truncated": payloads_cut,
         "detections": dets,
         "input_type": input_type,
     }
@@ -383,6 +391,9 @@ class WilliamTellsEngine:
             "mutations_tried": doc["mutations_tried"],
             "budget_exhausted": doc["budget_exhausted"],
             "detection_count": len(dets),
+            "detections_found": doc["detections_found"],
+            "detections_truncated": doc["detections_truncated"],
+            "payloads_truncated": doc["payloads_truncated"],
             "payloads": [d["payload"] for d in dets],
             "detections": Record(fields={
                 str(i): Record(fields=d) for i, d in enumerate(dets)

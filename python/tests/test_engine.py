@@ -113,6 +113,18 @@ class TestParseScanOutput:
         assert {w.code for w in warns} == {"detections_truncated", "payload_truncated"}
         assert len(doc["detections"][0]["payload"]) == wt.MAX_PAYLOAD_CHARS
 
+    def test_truncation_is_in_the_parsed_doc_not_only_in_warnings(self):
+        dets = [DET, {**DET, "payload": "p" * (wt.MAX_PAYLOAD_CHARS + 1)}] + [DET] * wt.MAX_DETECTIONS
+        doc, _ = parse_scan_output(_ok_doc(dets))
+        assert doc["detections_found"] == wt.MAX_DETECTIONS + 2
+        assert doc["detections_truncated"] is True and doc["payloads_truncated"] is True
+        assert [d["payload_truncated"] for d in doc["detections"][:3]] == [False, True, False]
+
+    def test_an_uncut_scan_says_so(self):
+        doc, _ = parse_scan_output(_ok_doc([DET]))
+        assert doc["detections_found"] == 1
+        assert doc["detections_truncated"] is False and doc["payloads_truncated"] is False
+        assert doc["detections"][0]["payload_truncated"] is False
 
     def test_budget_exhausted_is_carried_with_a_warning(self):
         raw = json.loads(_ok_doc([]))
@@ -160,6 +172,15 @@ class TestDetonate:
         res = eng.detonate(_input(tmp_path), tmp_path, Limits())
         assert res.status == "ok" and res.payload.fields["budget_exhausted"] is True
         assert [w.code for w in res.warnings] == ["scan_budget_exhausted"]
+
+    def test_truncation_is_visible_in_the_payload(self, tmp_path):
+        dets = [{**DET, "payload": "p" * (wt.MAX_PAYLOAD_CHARS + 1)}] * (wt.MAX_DETECTIONS + 3)
+        eng, _ = _engine(tmp_path, _ok_doc(dets))
+        f = eng.detonate(_input(tmp_path), tmp_path, Limits()).payload.fields
+        assert f["detection_count"] == wt.MAX_DETECTIONS
+        assert f["detections_found"] == wt.MAX_DETECTIONS + 3
+        assert f["detections_truncated"] is True and f["payloads_truncated"] is True
+        assert f["detections"].fields["0"].fields["payload_truncated"] is True
 
     def test_maps_to_record_and_requests_accelerators(self, tmp_path):
         eng, sb = _engine(tmp_path, _ok_doc([DET]))

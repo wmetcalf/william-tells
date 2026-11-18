@@ -100,6 +100,15 @@ import QRScanCore
         #expect(scan.detections.count == ScanOutputValidator.maxDetections)
         #expect(scan.detections[0].payload.count == ScanOutputValidator.maxPayloadChars)
         #expect(Set(warnings.map(\.code)) == ["detections_truncated", "payload_truncated"])
+        #expect(scan.found == 300 && scan.detectionsTruncated && scan.payloadsTruncated)
+        #expect(scan.detections.allSatisfy(\.payloadTruncated))
+    }
+
+    @Test func anUncutScanIsNotTruncated() throws {
+        guard case .ok(let scan, _) = try ScanOutputValidator.parse(doc()) else {
+            Issue.record("expected ok"); return
+        }
+        #expect(scan.found == 1 && !scan.detectionsTruncated && !scan.payloadsTruncated)
     }
 
     @Test func configIsStrict() throws {
@@ -313,6 +322,21 @@ struct SandboxedScannerTests {
         #expect(detected(env)["label"] as? String == "svg")
         #expect(detected(env)["mime"] as? String == "image/svg+xml")
         #expect(detected(env)["confidence"] as? Double == 1.0)
+    }
+
+    @Test func theEnvelopeCarriesTheTruncationFlags() {
+        let det = ValidDetection(payload: "p", symbology: "QR", confidence: 1, bboxX: 0, bboxY: 0,
+                                 bboxW: 1, bboxH: 1, payloadTruncated: true)
+        var s = ValidScan(mode: "default", compute: "auto", imageWidth: 1, imageHeight: 1,
+                          mutationsTried: 0, detections: [det])
+        s.detectionsFound = 300
+        let env = BlastboxEnvelope.envelope(outcome: .ok(s, warnings: [], elapsedMs: 1),
+                                            inputSHA256: "", head: Data())
+        let f = (env["payload"] as? [String: Any])?["fields"] as? [String: Any] ?? [:]
+        #expect(f["detection_count"] as? Int == 1 && f["detections_found"] as? Int == 300)
+        #expect(f["detections_truncated"] as? Bool == true && f["payloads_truncated"] as? Bool == true)
+        let d0 = ((f["detections"] as? [String: Any])?["fields"] as? [String: Any])?["0"] as? [String: Any]
+        #expect((d0?["fields"] as? [String: Any])?["payload_truncated"] as? Bool == true)
     }
 
     @Test func theMagicSniffSeparatesHEIFFromHEIC() {

@@ -497,7 +497,7 @@ App-Sandboxed process; about 135 ms per request at `wtqrk-worker`. (Python `http
 [`blastbox-engine.toml`](blastbox-engine.toml) states what the `williamtells` engine emits (both
 the Python engine and the native `wtqrk-worker`): no artifacts, a `wtqrk.scan/1` `record`
 payload with its required fields, the decoded-QR finding, the gaps a consumer must know about
-(truncation visible only in warnings, a budget-exhausted sweep is still `ok`, ...), and Loadout's
+(a budget-exhausted sweep is still `ok`, Loadout ignores the truncation flags, ...), and Loadout's
 mapper. Every result the tests produce is checked against it (`python/tests/conftest.py`).
 
 ```bash

@@ -57,7 +57,9 @@ def test_an_ok_scan_conforms_and_a_foreign_root_does_not(tmp_path, monkeypatch):
     assert res.status == "ok"
     ec.assert_conforms(contract, res, tmp_path)
     # The checker is live: the same result missing a promised field is caught.
-    fields = {k: v for k, v in res.payload.fields.items() if k != "budget_exhausted"}
-    bad = dataclasses.replace(res, payload=Record(fields=fields))
-    with pytest.raises(AssertionError, match="budget_exhausted"):
-        ec.assert_conforms(contract, bad, tmp_path)
+    for promised in ("budget_exhausted", "detections_found", "detections_truncated",
+                     "payloads_truncated"):
+        fields = {k: v for k, v in res.payload.fields.items() if k != promised}
+        bad = dataclasses.replace(res, payload=Record(fields=fields))
+        with pytest.raises(AssertionError, match=promised):
+            ec.assert_conforms(contract, bad, tmp_path)

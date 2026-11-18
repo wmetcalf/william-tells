@@ -7,6 +7,8 @@ public struct ValidDetection: Sendable, Equatable, Codable {
     public let symbology: String
     public let confidence: Double
     public let bboxX: Double, bboxY: Double, bboxW: Double, bboxH: Double
+    /// `payload` was cut to `ScanOutputValidator.maxPayloadChars`.
+    public var payloadTruncated: Bool = false
 }
 
 public struct ValidScan: Sendable, Codable {
@@ -20,6 +22,14 @@ public struct ValidScan: Sendable, Codable {
     public var inputType: String? = nil
     /// The scan stopped at its deadline before trying every mutation.
     public var budgetExhausted: Bool = false
+    /// Barcodes the scanner reported, before the `maxDetections` cut (`nil`: = detections.count).
+    public var detectionsFound: Int? = nil
+
+    /// The cuts, carried in the payload rather than only in warnings: `detections.count` is the
+    /// KEPT count, so a consumer needs the found count to see a truncated scan.
+    public var found: Int { detectionsFound ?? detections.count }
+    public var detectionsTruncated: Bool { found > detections.count }
+    public var payloadsTruncated: Bool { detections.contains(where: \.payloadTruncated) }
 }
 
 public struct ScanWarning: Sendable, Equatable, Codable {
@@ -89,7 +99,8 @@ public enum ScanOutputValidator {
                 payload: clip(payload, maxPayloadChars), symbology: clip(sym, 64),
                 confidence: try num(d["confidence"], 0, 1),
                 bboxX: try num(bb["x"], -10, 10), bboxY: try num(bb["y"], -10, 10),
-                bboxW: try num(bb["width"], 0, 10), bboxH: try num(bb["height"], 0, 10)))
+                bboxW: try num(bb["width"], 0, 10), bboxH: try num(bb["height"], 0, 10),
+                payloadTruncated: payload.count > maxPayloadChars))
         }
         guard let mode = doc["mode"] as? String, let compute = doc["compute"] as? String else {
             throw OutputError("mode/compute must be strings")
@@ -110,7 +121,8 @@ public enum ScanOutputValidator {
                              imageWidth: try int(dims["width"], 1, 1 << 20),
                              imageHeight: try int(dims["height"], 1, 1 << 20),
                              mutationsTried: try int(report["mutationsTried"], 0, QRScannerEngine.maxMutationsTried),
-                             detections: dets, inputType: inputType, budgetExhausted: exhausted),
+                             detections: dets, inputType: inputType, budgetExhausted: exhausted,
+                             detectionsFound: raw.count),
                    warnings: warnings)
     }
 
