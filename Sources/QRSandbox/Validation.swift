@@ -7,6 +7,8 @@ public struct ValidDetection: Sendable, Equatable, Codable {
     public let symbology: String
     public let confidence: Double
     public let bboxX: Double, bboxY: Double, bboxW: Double, bboxH: Double
+    /// `payload` was cut to `ScanOutputValidator.maxPayloadChars`.
+    public var payloadTruncated: Bool = false
 }
 
 public struct ValidScan: Sendable, Codable {
@@ -20,6 +22,14 @@ public struct ValidScan: Sendable, Codable {
     public var inputType: String? = nil
     /// The scan stopped at its deadline before trying every mutation.
     public var budgetExhausted: Bool = false
+    /// Barcodes the scanner reported, before the `maxDetections` cut (`nil`: = detections.count).
+    public var detectionsFound: Int? = nil
+
+    /// The cuts, carried in the payload rather than only in warnings: `detections.count` is the
+    /// KEPT count, so a consumer needs the found count to see a truncated scan.
+    public var found: Int { detectionsFound ?? detections.count }
+    public var detectionsTruncated: Bool { found > detections.count }
+    public var payloadsTruncated: Bool { detections.contains(where: \.payloadTruncated) }
 }
 
 public struct ScanWarning: Sendable, Equatable, Codable {
@@ -62,7 +72,8 @@ public enum ScanOutputValidator {
         }
         guard isTrue(doc["ok"]) else {
             let err = doc["error"] as? [String: Any] ?? [:]
-            return .failed(code: clip(err["code"] as? String ?? "scan_failed", 64),
+            let code = err["code"] as? String ?? ""
+            return .failed(code: clip(code.isEmpty ? "scan_failed" : code, 64),
                            message: clip(err["message"] as? String ?? "", 2000))
         }
         guard let report = doc["report"] as? [String: Any] else { throw OutputError("report missing") }
@@ -78,7 +89,7 @@ public enum ScanOutputValidator {
         for item in raw.prefix(maxDetections) {
             guard let d = item as? [String: Any] else { throw OutputError("detection must be an object") }
             guard let payload = d["payload"] as? String else { throw OutputError("payload must be a string") }
-            if payload.count > maxPayloadChars {
+            if overLimit(payload, maxPayloadChars) {
                 warnings.append(ScanWarning(code: "payload_truncated",
                                             message: "a payload was cut to \(maxPayloadChars) chars"))
             }
@@ -89,7 +100,8 @@ public enum ScanOutputValidator {
                 payload: clip(payload, maxPayloadChars), symbology: clip(sym, 64),
                 confidence: try num(d["confidence"], 0, 1),
                 bboxX: try num(bb["x"], -10, 10), bboxY: try num(bb["y"], -10, 10),
-                bboxW: try num(bb["width"], 0, 10), bboxH: try num(bb["height"], 0, 10)))
+                bboxW: try num(bb["width"], 0, 10), bboxH: try num(bb["height"], 0, 10),
+                payloadTruncated: overLimit(payload, maxPayloadChars)))
         }
         guard let mode = doc["mode"] as? String, let compute = doc["compute"] as? String else {
             throw OutputError("mode/compute must be strings")
@@ -110,7 +122,8 @@ public enum ScanOutputValidator {
                              imageWidth: try int(dims["width"], 1, 1 << 20),
                              imageHeight: try int(dims["height"], 1, 1 << 20),
                              mutationsTried: try int(report["mutationsTried"], 0, QRScannerEngine.maxMutationsTried),
-                             detections: dets, inputType: inputType, budgetExhausted: exhausted),
+                             detections: dets, inputType: inputType, budgetExhausted: exhausted,
+                             detectionsFound: raw.count),
                    warnings: warnings)
     }
 
@@ -139,7 +152,14 @@ public enum ScanOutputValidator {
         return i
     }
 
-    static func clip(_ s: String, _ n: Int) -> String { s.count > n ? String(s.prefix(n)) : s }
+    /// Cut `s` to `n` Unicode scalars (code points), the unit the Python engine's `len` counts, so
+    /// both agents cut, and flag, the same payload. `String.count` counts grapheme clusters, and one
+    /// cluster can hold any number of scalars (CR LF, combining marks).
+    static func clip(_ s: String, _ n: Int) -> String {
+        s.unicodeScalars.count > n ? String(String.UnicodeScalarView(s.unicodeScalars.prefix(n))) : s
+    }
+
+    static func overLimit(_ s: String, _ n: Int) -> Bool { s.unicodeScalars.count > n }
 
     /// Strict `WTQRK_CONFIG`: an object of known keys, each a list of at most 10 finite numbers.
     /// Returns canonical JSON for the scanner's `--config-json`.

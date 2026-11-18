@@ -18,6 +18,7 @@ import pytest
 from blastbox.contract import Record
 from blastbox.limits import Limits
 from blastbox.worker.sandbox.base import SandboxResult
+from conftest import conform
 
 from william_tells import blastbox_engine as wt
 from william_tells.blastbox_engine import WilliamTellsEngine, parse_scan_output, sniff
@@ -112,6 +113,18 @@ class TestParseScanOutput:
         assert {w.code for w in warns} == {"detections_truncated", "payload_truncated"}
         assert len(doc["detections"][0]["payload"]) == wt.MAX_PAYLOAD_CHARS
 
+    def test_truncation_is_in_the_parsed_doc_not_only_in_warnings(self):
+        dets = [DET, {**DET, "payload": "p" * (wt.MAX_PAYLOAD_CHARS + 1)}] + [DET] * wt.MAX_DETECTIONS
+        doc, _ = parse_scan_output(_ok_doc(dets))
+        assert doc["detections_found"] == wt.MAX_DETECTIONS + 2
+        assert doc["detections_truncated"] is True and doc["payloads_truncated"] is True
+        assert [d["payload_truncated"] for d in doc["detections"][:3]] == [False, True, False]
+
+    def test_an_uncut_scan_says_so(self):
+        doc, _ = parse_scan_output(_ok_doc([DET]))
+        assert doc["detections_found"] == 1
+        assert doc["detections_truncated"] is False and doc["payloads_truncated"] is False
+        assert doc["detections"][0]["payload_truncated"] is False
 
     def test_budget_exhausted_is_carried_with_a_warning(self):
         raw = json.loads(_ok_doc([]))
@@ -159,6 +172,15 @@ class TestDetonate:
         res = eng.detonate(_input(tmp_path), tmp_path, Limits())
         assert res.status == "ok" and res.payload.fields["budget_exhausted"] is True
         assert [w.code for w in res.warnings] == ["scan_budget_exhausted"]
+
+    def test_truncation_is_visible_in_the_payload(self, tmp_path):
+        dets = [{**DET, "payload": "p" * (wt.MAX_PAYLOAD_CHARS + 1)}] * (wt.MAX_DETECTIONS + 3)
+        eng, _ = _engine(tmp_path, _ok_doc(dets))
+        f = eng.detonate(_input(tmp_path), tmp_path, Limits()).payload.fields
+        assert f["detection_count"] == wt.MAX_DETECTIONS
+        assert f["detections_found"] == wt.MAX_DETECTIONS + 3
+        assert f["detections_truncated"] is True and f["payloads_truncated"] is True
+        assert f["detections"].fields["0"].fields["payload_truncated"] is True
 
     def test_maps_to_record_and_requests_accelerators(self, tmp_path):
         eng, sb = _engine(tmp_path, _ok_doc([DET]))
@@ -279,8 +301,9 @@ def _sealed_run(engine, input_path: Path, tmp_path: Path):
     limits = Limits(timeout_s=120)
     assert run_detonation(engine, input_path=input_path, output_dir=out, limits=limits) == 0
     sha = hashlib.sha256(input_path.read_bytes()).hexdigest()
-    return validate_worker_output(output_dir=out, input_sha256=sha, engine=engine.name,
-                                  limits=limits)
+    env = validate_worker_output(output_dir=out, input_sha256=sha, engine=engine.name,
+                                 limits=limits)
+    return conform(env)
 
 
 @needs_real
@@ -455,3 +478,94 @@ class TestPrecheck:
         meta = _json.loads((out / "metadata.json").read_text())
         assert meta["status"] == "rejected" and called == []
         assert ledger.rejected_before_parse
+
+
+class TestHostileScannerShapesMatchTheNativeAgent:
+    """The native agent (Validation.swift) handles these the same way."""
+
+    @pytest.mark.parametrize("code", ["", None, 0, 12, ["c"], {}])
+    def test_an_empty_or_non_string_error_code_is_scan_failed(self, tmp_path, code):
+        out = json.dumps({"schema": wt.SCHEMA, "ok": False,
+                          "error": {"code": code, "message": "nope"}}).encode()
+        eng, _ = _engine(tmp_path, out, rc=2)
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "rejected"
+        assert [w.code for w in res.warnings] == ["scan_failed"]
+        assert res.payload.fields["error"] == "scan_failed"
+
+    def test_a_non_string_error_message_is_empty(self, tmp_path):
+        out = json.dumps({"schema": wt.SCHEMA, "ok": False,
+                          "error": {"code": "invalid_image", "message": 5}}).encode()
+        eng, _ = _engine(tmp_path, out, rc=2)
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "rejected" and res.warnings[0].message == ""
+
+    @pytest.mark.parametrize("out", [
+        # What Foundation's JSONSerialization refuses, anywhere in the document.
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "\\ud800", "message": "m"}}',
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "c", "message": "a\\udfff"}}',
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "c"}, "x": NaN}',
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "c"}, "x": 1e400}',
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "c"}, "x": 1' + b"0" * 400 + b'}',
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "c"}, "x": '
+        + b"[" * 20000 + b"]" * 20000 + b'}',
+    ])
+    def test_json_foundation_refuses_is_bad_scanner_output(self, tmp_path, out):
+        eng, _ = _engine(tmp_path, out, rc=2)
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "engine_error" and res.warnings[0].code == "bad_scanner_output"
+
+    @pytest.mark.parametrize("n", ["9223372036854775807", "-9223372036854775808",
+                                   "18446744073709551616", "1" + "0" * 308])
+    def test_integers_finite_as_a_double_are_accepted(self, n):
+        # Foundation's JSONSerialization parses these too.
+        assert wt._strict_json('{"x": ' + n + '}') == {"x": int(n)}
+
+    @pytest.mark.parametrize("n", ["1" + "0" * 309, "-1" + "0" * 309])
+    def test_integers_past_a_double_are_refused(self, n):
+        with pytest.raises(ValueError):
+            wt._strict_json('{"x": ' + n + '}')
+
+    def test_a_19_digit_config_value_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("WTQRK_CONFIG", '{"rotationDegrees": [1000000000000000000]}')
+        assert wt._bad_params() is None
+
+    def test_nesting_past_foundations_limit_is_refused(self):
+        assert wt._strict_json("[" * 512 + "]" * 512) is not None
+        with pytest.raises(ValueError):
+            wt._strict_json("[" * 513 + "]" * 513)
+        assert wt._strict_json('{"a":' * 511 + "1" + "}" * 511) is not None
+        assert wt._strict_json('{"a":' * 512 + "1" + "}" * 512) is not None
+        with pytest.raises(ValueError):
+            wt._strict_json('{"a":' * 513 + "1" + "}" * 513)
+
+    def test_a_309_digit_integer_past_a_double_is_refused(self):
+        # Both 309 digits: the length guard passes them; float() decides.
+        top = 2**1024 - 2**970        # rounds to infinity
+        assert wt._strict_json(str(top - 1)) == top - 1
+        with pytest.raises(ValueError):
+            wt._strict_json(str(top))
+
+    def test_a_huge_integer_in_the_config_is_bad_config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WTQRK_CONFIG", '{"scales": [1' + "0" * 400 + ']}')
+        eng, _ = _engine(tmp_path, _ok_doc([]))
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "rejected" and res.warnings[0].code == "bad_config"
+
+    @pytest.mark.parametrize("field", ["payload", "symbology"])
+    def test_a_lone_surrogate_is_bad_scanner_output(self, tmp_path, field):
+        det = dict(DET, **{field: "\ud800"})
+        eng, _ = _engine(tmp_path, json.dumps({"schema": wt.SCHEMA, "ok": True, "mode": "default",
+                                               "compute": "auto", "report": {
+                                                   "imageDimensions": {"width": 1, "height": 1},
+                                                   "mutationsTried": 0, "detections": [det]}}).encode())
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "engine_error" and res.warnings[0].code == "bad_scanner_output"
+
+    @pytest.mark.parametrize("dims", [[1, 2], "640x480", 7])
+    def test_non_object_image_dimensions_are_bad_scanner_output(self, tmp_path, dims):
+        raw = json.loads(_ok_doc([DET]))
+        raw["report"]["imageDimensions"] = dims
+        eng, _ = _engine(tmp_path, json.dumps(raw).encode())
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "engine_error" and res.warnings[0].code == "bad_scanner_output"

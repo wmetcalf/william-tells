@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 from blastbox.host.dispatch import validate_worker_output
 from blastbox.limits import Limits
+from conftest import conform
 
 REPO = Path(__file__).resolve().parents[2]
 WORKER = REPO / ".build" / "release" / "wtqrk-worker"
@@ -97,8 +98,9 @@ def _gate(tar_bytes: bytes, body: bytes, tmp: Path):
     with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as tf:
         assert tf.getnames() == ["metadata.json"]
         tf.extractall(out, filter="data")
-    return validate_worker_output(output_dir=out, input_sha256=hashlib.sha256(body).hexdigest(),
-                                  engine="williamtells", limits=Limits())
+    # The native agent is held to the same engine contract as the Python engine.
+    return conform(validate_worker_output(output_dir=out, input_sha256=hashlib.sha256(body).hexdigest(),
+                                          engine="williamtells", limits=Limits()))
 
 
 def _qr(msg: str, tmp: Path) -> bytes:
