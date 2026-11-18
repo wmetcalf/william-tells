@@ -478,3 +478,35 @@ class TestPrecheck:
         meta = _json.loads((out / "metadata.json").read_text())
         assert meta["status"] == "rejected" and called == []
         assert ledger.rejected_before_parse
+
+
+class TestHostileScannerShapesMatchTheNativeAgent:
+    """The native agent (Validation.swift) handles these the same way."""
+
+    @pytest.mark.parametrize("code", ["", None, 0, 12, ["c"], {}])
+    def test_an_empty_or_non_string_error_code_is_scan_failed(self, tmp_path, code):
+        out = json.dumps({"schema": wt.SCHEMA, "ok": False,
+                          "error": {"code": code, "message": "nope"}}).encode()
+        eng, _ = _engine(tmp_path, out, rc=2)
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "rejected"
+        assert [w.code for w in res.warnings] == ["scan_failed"]
+        assert res.payload.fields["error"] == "scan_failed"
+
+    @pytest.mark.parametrize("field", ["payload", "symbology"])
+    def test_a_lone_surrogate_is_bad_scanner_output(self, tmp_path, field):
+        det = dict(DET, **{field: "\ud800"})
+        eng, _ = _engine(tmp_path, json.dumps({"schema": wt.SCHEMA, "ok": True, "mode": "default",
+                                               "compute": "auto", "report": {
+                                                   "imageDimensions": {"width": 1, "height": 1},
+                                                   "mutationsTried": 0, "detections": [det]}}).encode())
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "engine_error" and res.warnings[0].code == "bad_scanner_output"
+
+    @pytest.mark.parametrize("dims", [[1, 2], "640x480", 7])
+    def test_non_object_image_dimensions_are_bad_scanner_output(self, tmp_path, dims):
+        raw = json.loads(_ok_doc([DET]))
+        raw["report"]["imageDimensions"] = dims
+        eng, _ = _engine(tmp_path, json.dumps(raw).encode())
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "engine_error" and res.warnings[0].code == "bad_scanner_output"

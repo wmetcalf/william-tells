@@ -138,6 +138,11 @@ def _int(v: Any, lo: int, hi: int) -> int:
 def _str(v: Any, limit: int) -> tuple[str, bool]:
     if not isinstance(v, str):
         raise ValueError(f"not a string: {type(v).__name__}")
+    try:
+        v.encode("utf-8")
+    except UnicodeEncodeError:
+        # json.loads keeps a lone surrogate (\ud800); the envelope could not be serialized.
+        raise ValueError("string is not valid Unicode (lone surrogate)") from None
     return (v[:limit], len(v) > limit)
 
 
@@ -168,7 +173,11 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
     report = doc.get("report")
     if not isinstance(report, dict):
         raise ValueError("report missing")
-    dims = report.get("imageDimensions") or {}
+    dims = report.get("imageDimensions")
+    if dims is None:
+        dims = {}
+    if not isinstance(dims, dict):
+        raise ValueError("imageDimensions must be an object")
     warnings: list[Warning] = []
     raw_dets = report.get("detections")
     if not isinstance(raw_dets, list):
@@ -368,8 +377,12 @@ class WilliamTellsEngine:
 
         if doc.get("ok") is not True:
             err = doc.get("error") if isinstance(doc.get("error"), dict) else {}
-            code = str(err.get("code", "scan_failed"))[:64]
-            msg = str(err.get("message", ""))[:2000]
+            # As the native agent: a missing, empty or non-string code is scan_failed, and a
+            # non-string message is empty.
+            code = err.get("code")
+            code = code[:64] if isinstance(code, str) and code else "scan_failed"
+            msg = err.get("message")
+            msg = msg[:2000] if isinstance(msg, str) else ""
             status = "rejected" if r.exit_code in (2, 3) else "engine_error"
             return error(code, msg, status=status)
         if r.exit_code != 0:

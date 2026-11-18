@@ -9,6 +9,9 @@ name = "williamtells"
 formats = ["png", "jpeg", "heic", "heif", "webp", "tiff", "gif", "bmp", "svg", "pdf"]
 network = ["none"]
 # No fixed cap in the engine: limits.max_input_bytes is forwarded to wtqrk-scan (--max-bytes).
+# The native wtqrk-worker reads its limits only from BLASTBOX_* job params, which blastbox's
+# dispatcher strips, so it runs at its built-in defaults (120 s, 8 GiB, 100 MiB input, 4 MiB
+# metadata) whatever the host's Limits say.
 statuses = ["ok", "rejected", "engine_error"]
 
 # No [[artifacts]]: the engine writes nothing under outdir; every result is payload-only.

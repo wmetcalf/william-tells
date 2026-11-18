@@ -98,7 +98,9 @@ public enum BlastboxEnvelope {
     }
 
     public static func metadataJSON(_ envelope: [String: Any]) throws -> Data {
-        try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
+        // No "\/" escaping: the Python harness writes "/" as is, and escaping can double a
+        // slash-heavy result past the host's metadata cap.
+        try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys, .withoutEscapingSlashes])
     }
 
     /// A ustar archive holding exactly one regular file.
