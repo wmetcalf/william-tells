@@ -107,9 +107,39 @@ def sniff(head: bytes) -> tuple[str, str]:
     return "unknown", "application/octet-stream"
 
 
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"non-finite number {name}")
+
+
+def _bounded_int(text: str) -> int:
+    if len(text.lstrip("-")) > 18:
+        raise ValueError("integer too large")
+    return int(text)
+
+
+def _finite_float(text: str) -> float:
+    v = float(text)
+    if not math.isfinite(v):
+        raise ValueError(f"non-finite number {text[:32]}")
+    return v
+
+
+def _strict_json(raw: str | bytes) -> Any:
+    """``json.loads`` refusing what Foundation's JSONSerialization (the native agent's parser)
+    refuses: NaN/Infinity, numbers that overflow, lone surrogates, and nesting deep enough to
+    exhaust the stack. All of it raises ValueError, so both agents call it bad output."""
+    try:
+        doc = json.loads(raw, parse_constant=_no_constant, parse_int=_bounded_int,
+                         parse_float=_finite_float)
+        json.dumps(doc, ensure_ascii=False).encode("utf-8")
+    except (RecursionError, UnicodeEncodeError) as exc:
+        raise ValueError(f"unacceptable JSON ({type(exc).__name__})") from None
+    return doc
+
+
 def _validate_config(raw: str) -> str:
     """Parse WTQRK_CONFIG strictly; return canonical JSON. ValueError on anything odd."""
-    cfg = json.loads(raw)
+    cfg = _strict_json(raw)
     if not isinstance(cfg, dict) or not set(cfg) <= _CONFIG_KEYS:
         raise ValueError(f"WTQRK_CONFIG must be an object with keys from {sorted(_CONFIG_KEYS)}")
     for key, values in cfg.items():
@@ -162,7 +192,7 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
     """
     if len(stdout) > MAX_STDOUT_BYTES:
         raise ValueError(f"scanner output exceeds {MAX_STDOUT_BYTES} bytes")
-    doc = json.loads(stdout)
+    doc = _strict_json(stdout)
     if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
         raise ValueError("scanner output has the wrong schema")
     input_type = doc.get("inputType")

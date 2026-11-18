@@ -351,6 +351,12 @@ struct SandboxedScannerTests {
         #expect((d0?["fields"] as? [String: Any])?["payload_truncated"] as? Bool == true)
     }
 
+    @Test func metadataDoesNotEscapeSlashes() throws {
+        // "\/" would double a slash-heavy result toward the host's metadata cap.
+        let data = try BlastboxEnvelope.metadataJSON(["p": "a/b"])
+        #expect(String(decoding: data, as: UTF8.self) == #"{"p":"a/b"}"#)
+    }
+
     @Test func envelopeWarningsAreCutByCodePoint() {
         // One grapheme of 3,001 code points: a grapheme cut keeps it whole, over blastbox's
         // 2,000-code-point Warning.message limit.

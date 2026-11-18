@@ -493,6 +493,34 @@ class TestHostileScannerShapesMatchTheNativeAgent:
         assert [w.code for w in res.warnings] == ["scan_failed"]
         assert res.payload.fields["error"] == "scan_failed"
 
+    def test_a_non_string_error_message_is_empty(self, tmp_path):
+        out = json.dumps({"schema": wt.SCHEMA, "ok": False,
+                          "error": {"code": "invalid_image", "message": 5}}).encode()
+        eng, _ = _engine(tmp_path, out, rc=2)
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "rejected" and res.warnings[0].message == ""
+
+    @pytest.mark.parametrize("out", [
+        # What Foundation's JSONSerialization refuses, anywhere in the document.
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "\\ud800", "message": "m"}}',
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "c", "message": "a\\udfff"}}',
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "c"}, "x": NaN}',
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "c"}, "x": 1e400}',
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "c"}, "x": 1' + b"0" * 400 + b'}',
+        b'{"schema": "wtqrk.scan/1", "ok": false, "error": {"code": "c"}, "x": '
+        + b"[" * 20000 + b"]" * 20000 + b'}',
+    ])
+    def test_json_foundation_refuses_is_bad_scanner_output(self, tmp_path, out):
+        eng, _ = _engine(tmp_path, out, rc=2)
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "engine_error" and res.warnings[0].code == "bad_scanner_output"
+
+    def test_a_huge_integer_in_the_config_is_bad_config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WTQRK_CONFIG", '{"scales": [1' + "0" * 400 + ']}')
+        eng, _ = _engine(tmp_path, _ok_doc([]))
+        res = eng.detonate(_input(tmp_path), tmp_path, Limits())
+        assert res.status == "rejected" and res.warnings[0].code == "bad_config"
+
     @pytest.mark.parametrize("field", ["payload", "symbology"])
     def test_a_lone_surrogate_is_bad_scanner_output(self, tmp_path, field):
         det = dict(DET, **{field: "\ud800"})
