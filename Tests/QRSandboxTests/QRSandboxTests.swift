@@ -351,6 +351,20 @@ struct SandboxedScannerTests {
         #expect((d0?["fields"] as? [String: Any])?["payload_truncated"] as? Bool == true)
     }
 
+    @Test func envelopeWarningsAreCutByCodePoint() {
+        // One grapheme of 3,001 code points: a grapheme cut keeps it whole, over blastbox's
+        // 2,000-code-point Warning.message limit.
+        let msg = "a" + String(repeating: "\u{301}", count: 3000)
+        let env = BlastboxEnvelope.envelope(outcome: .rejected(code: "bad_param", message: msg),
+                                            inputSHA256: "", head: Data())
+        let w = (env["warnings"] as? [[String: String]])?.first
+        #expect(w?["message"]?.unicodeScalars.count == 2000)
+        #expect(w?["code"] == "bad_param")
+        let empty = BlastboxEnvelope.envelope(outcome: .engineError(code: "", message: "m"),
+                                              inputSHA256: "", head: Data())
+        #expect((empty["warnings"] as? [[String: String]])?.first?["code"] == "engine_error")
+    }
+
     @Test func theMagicSniffSeparatesHEIFFromHEIC() {
         func ftyp(_ brand: String) -> Data { Data([0, 0, 0, 0x18]) + Data("ftyp\(brand)".utf8) + Data(count: 12) }
         for b in ["heic", "heix", "heim", "heis"] { #expect(BlastboxEnvelope.sniff(ftyp(b)) == ("heic", "image/heic")) }

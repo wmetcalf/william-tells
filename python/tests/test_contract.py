@@ -40,7 +40,7 @@ class _Sandbox:
         return SandboxResult(exit_code=0, stdout=self.stdout, stderr=b"")
 
 
-def test_an_ok_scan_conforms_and_a_foreign_root_does_not(tmp_path, monkeypatch):
+def test_an_ok_scan_conforms_and_a_missing_promised_field_does_not(tmp_path, monkeypatch):
     monkeypatch.setenv("WTQRK_SELF_TEST", "0")
     det = {"payload": "https://x", "symbology": "VNBarcodeSymbologyQR", "confidence": 1.0,
            "boundingBox": {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4}}

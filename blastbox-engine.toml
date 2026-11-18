@@ -20,7 +20,10 @@ statuses = ["ok", "rejected", "engine_error"]
 #     confidence, bbox_x, bbox_y, bbox_w, bbox_h, payload_truncated}, ...}}
 # detection_count is the KEPT count (at most 256); detections_found is what the scanner
 # reported before that cut, and the *_truncated flags say whether either cut happened.
-# rejected / engine_error: Record{schema, error} plus one warning with the same code.
+# rejected / engine_error from the engine itself: Record{schema, error} plus one warning with
+# the same code. When precheck/detonate RAISES (e.g. wtqrk-scan missing), blastbox's harness
+# seals engine_error with Record{error: <scrubbed message>} (no schema) and warning code
+# engine_error. Key error handling on status and the warnings, not on payload.schema.
 root = "record"
 node_types = ["record"]
 schema_field = "schema"
@@ -43,6 +46,10 @@ description = "Decoded barcodes are bare strings in payloads[]: no stable findin
 [[gaps]]
 id = "partial-sweep-is-ok"
 description = "A scan that ran out of time budget is status ok with budget_exhausted=true and warning scan_budget_exhausted; an empty payloads[] then is not a full sweep and must not be read as 'no QR'."
+
+[[gaps]]
+id = "first-hit-ends-sweep"
+description = "The scan stops early: any decode on the raw image returns before a single mutation runs (mutations_tried=0), in both modes, and default mode also returns at the first mutation that finds a new barcode. That result is status ok with budget_exhausted=false and no warning, so a non-empty payloads[] does not mean every barcode in the image was found: a benign decoy that decodes raw hides one that only a mutation would decode. Only an empty, non-exhausted scan has tried every mutation of its mode."
 
 [[gaps]]
 id = "detections-keyed-record"

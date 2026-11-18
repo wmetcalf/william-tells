@@ -61,7 +61,11 @@ public enum BlastboxEnvelope {
         func env(status: String, fields: [String: Any], warnings: [ScanWarning]) -> [String: Any] {
             ["engine": engine, "status": status, "input_sha256": inputSHA256, "detected": detected,
              "artifacts": [Any](),
-             "warnings": warnings.map { ["code": String($0.code.prefix(64)), "message": String($0.message.prefix(2000))] },
+             // Cut by code point, the unit blastbox's Warning limits count (code 1...64,
+             // message <= 2000); a grapheme cut lets combining marks through and the host's
+             // re-validation then fails the job.
+             "warnings": warnings.map { ["code": ScanOutputValidator.clip($0.code.isEmpty ? status : $0.code, 64),
+                                         "message": ScanOutputValidator.clip($0.message, 2000)] },
              "payload": ["_type": "record", "fields": fields]]
         }
         switch outcome {
@@ -85,10 +89,10 @@ public enum BlastboxEnvelope {
                 "detections": ["_type": "record", "fields": dets],
             ], warnings: warnings)
         case .rejected(let code, let message):
-            return env(status: "rejected", fields: ["schema": schema, "error": String(code.prefix(64))],
+            return env(status: "rejected", fields: ["schema": schema, "error": ScanOutputValidator.clip(code, 64)],
                        warnings: [ScanWarning(code: code, message: message)])
         case .engineError(let code, let message):
-            return env(status: "engine_error", fields: ["schema": schema, "error": String(code.prefix(64))],
+            return env(status: "engine_error", fields: ["schema": schema, "error": ScanOutputValidator.clip(code, 64)],
                        warnings: [ScanWarning(code: code, message: message)])
         }
     }

@@ -72,7 +72,8 @@ public enum ScanOutputValidator {
         }
         guard isTrue(doc["ok"]) else {
             let err = doc["error"] as? [String: Any] ?? [:]
-            return .failed(code: clip(err["code"] as? String ?? "scan_failed", 64),
+            let code = err["code"] as? String ?? ""
+            return .failed(code: clip(code.isEmpty ? "scan_failed" : code, 64),
                            message: clip(err["message"] as? String ?? "", 2000))
         }
         guard let report = doc["report"] as? [String: Any] else { throw OutputError("report missing") }
