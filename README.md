@@ -505,9 +505,8 @@ python -m blastbox.contract.engine_contract validate blastbox-engine.toml
 python -m blastbox.contract.engine_contract check blastbox-engine.toml metadata.json
 ```
 
-The checker is not in a released blastbox yet; until it is, the conformance hook is a no-op and
-`python/tests/test_contract.py` skips. To run it against the contract branch:
-`PYTHONPATH=<blastbox-checkout>/src python -m pytest` from `python/`.
+The checker ships in blastbox 0.1.49, which `python/pyproject.toml` requires; the tests import it
+directly, so an older blastbox fails test collection rather than silently skipping the contract.
 
 ## License
 

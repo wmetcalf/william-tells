@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-ec = pytest.importorskip("blastbox.contract.engine_contract")
+import blastbox.contract.engine_contract as ec  # noqa: E402
 
 from blastbox.contract import Record  # noqa: E402
 from blastbox.limits import Limits  # noqa: E402
