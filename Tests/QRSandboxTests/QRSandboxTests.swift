@@ -100,6 +100,27 @@ import QRScanCore
         #expect(scan.detections.count == ScanOutputValidator.maxDetections)
         #expect(scan.detections[0].payload.count == ScanOutputValidator.maxPayloadChars)
         #expect(Set(warnings.map(\.code)) == ["detections_truncated", "payload_truncated"])
+        #expect(scan.found == 300 && scan.detectionsTruncated && scan.payloadsTruncated)
+        #expect(scan.detections.allSatisfy { $0.payloadTruncated })
+    }
+
+    @Test func anUncutScanIsNotTruncated() throws {
+        guard case .ok(let scan, _) = try ScanOutputValidator.parse(doc()) else {
+            Issue.record("expected ok"); return
+        }
+        #expect(scan.found == 1 && !scan.detectionsTruncated && !scan.payloadsTruncated)
+    }
+
+    @Test func payloadLimitCountsCodePointsLikeThePythonEngine() throws {
+        // 2,100 CR LF pairs: 4,200 code points, but only 2,100 grapheme clusters.
+        let crlf = String(repeating: "\\r\\n", count: 2100)
+        let det = #"{"payload":"\#(crlf)","symbology":"QR","confidence":1,"boundingBox":{"x":0,"y":0,"width":1,"height":1}}"#
+        guard case .ok(let scan, let warnings) = try ScanOutputValidator.parse(doc("[" + det + "]")) else {
+            Issue.record("expected ok"); return
+        }
+        #expect(scan.detections[0].payload.unicodeScalars.count == ScanOutputValidator.maxPayloadChars)
+        #expect(scan.payloadsTruncated)
+        #expect(warnings.map(\.code) == ["payload_truncated"])
     }
 
     @Test func configIsStrict() throws {
@@ -313,6 +334,41 @@ struct SandboxedScannerTests {
         #expect(detected(env)["label"] as? String == "svg")
         #expect(detected(env)["mime"] as? String == "image/svg+xml")
         #expect(detected(env)["confidence"] as? Double == 1.0)
+    }
+
+    @Test func theEnvelopeCarriesTheTruncationFlags() {
+        let det = ValidDetection(payload: "p", symbology: "QR", confidence: 1, bboxX: 0, bboxY: 0,
+                                 bboxW: 1, bboxH: 1, payloadTruncated: true)
+        var s = ValidScan(mode: "default", compute: "auto", imageWidth: 1, imageHeight: 1,
+                          mutationsTried: 0, detections: [det])
+        s.detectionsFound = 300
+        let env = BlastboxEnvelope.envelope(outcome: .ok(s, warnings: [], elapsedMs: 1),
+                                            inputSHA256: "", head: Data())
+        let f = (env["payload"] as? [String: Any])?["fields"] as? [String: Any] ?? [:]
+        #expect(f["detection_count"] as? Int == 1 && f["detections_found"] as? Int == 300)
+        #expect(f["detections_truncated"] as? Bool == true && f["payloads_truncated"] as? Bool == true)
+        let d0 = ((f["detections"] as? [String: Any])?["fields"] as? [String: Any])?["0"] as? [String: Any]
+        #expect((d0?["fields"] as? [String: Any])?["payload_truncated"] as? Bool == true)
+    }
+
+    @Test func metadataDoesNotEscapeSlashes() throws {
+        // "\/" would double a slash-heavy result toward the host's metadata cap.
+        let data = try BlastboxEnvelope.metadataJSON(["p": "a/b"])
+        #expect(String(decoding: data, as: UTF8.self) == #"{"p":"a/b"}"#)
+    }
+
+    @Test func envelopeWarningsAreCutByCodePoint() {
+        // One grapheme of 3,001 code points: a grapheme cut keeps it whole, over blastbox's
+        // 2,000-code-point Warning.message limit.
+        let msg = "a" + String(repeating: "\u{301}", count: 3000)
+        let env = BlastboxEnvelope.envelope(outcome: .rejected(code: "bad_param", message: msg),
+                                            inputSHA256: "", head: Data())
+        let w = (env["warnings"] as? [[String: String]])?.first
+        #expect(w?["message"]?.unicodeScalars.count == 2000)
+        #expect(w?["code"] == "bad_param")
+        let empty = BlastboxEnvelope.envelope(outcome: .engineError(code: "", message: "m"),
+                                              inputSHA256: "", head: Data())
+        #expect((empty["warnings"] as? [[String: String]])?.first?["code"] == "engine_error")
     }
 
     @Test func theMagicSniffSeparatesHEIFFromHEIC() {

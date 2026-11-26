@@ -1,0 +1,80 @@
+# Engine output contract for `williamtells` (schema blastbox-engine-contract/1).
+# Describes what python/william_tells/blastbox_engine.py and the native Swift agent
+# (Sources/QRSandbox/BlastboxEnvelope.swift) emit TODAY; both produce the same envelope.
+# Validate: python -m blastbox.contract.engine_contract validate blastbox-engine.toml
+schema = "blastbox-engine-contract/1"
+
+[engine]
+name = "williamtells"
+formats = ["png", "jpeg", "heic", "heif", "webp", "tiff", "gif", "bmp", "svg", "pdf"]
+network = ["none"]
+# No fixed cap in the engine: limits.max_input_bytes is forwarded to wtqrk-scan (--max-bytes).
+# The native wtqrk-worker reads its limits only from X-Blastbox-Params. The dispatcher drops a
+# client's BLASTBOX_* params but forwards its own BLASTBOX_MAX_METADATA (and the artifact and
+# egress caps), so the native metadata cap follows the host; timeout (120 s), memory (8 GiB)
+# and max input (100 MiB) stay at the worker's built-in defaults.
+statuses = ["ok", "rejected", "engine_error"]
+
+# No [[artifacts]]: the engine writes nothing under outdir; every result is payload-only.
+
+[payload]
+# ok: Record{schema, mode, compute, image_width, image_height, mutations_tried,
+#     budget_exhausted, detection_count, detections_found, detections_truncated,
+#     payloads_truncated, payloads[], detections: Record{"0": Record{payload, symbology,
+#     confidence, bbox_x, bbox_y, bbox_w, bbox_h, payload_truncated}, ...}}
+# detection_count is the KEPT count (at most 256); detections_found is what the scanner
+# reported before that cut, and the *_truncated flags say whether either cut happened.
+# rejected / engine_error from the engine itself: Record{schema, error} plus one warning with
+# the same code. When precheck/detonate RAISES (e.g. wtqrk-scan missing), blastbox's harness
+# seals engine_error with Record{error: <scrubbed message>} (no schema) and warning code
+# engine_error. Key error handling on status and the warnings, not on payload.schema.
+root = "record"
+node_types = ["record"]
+schema_field = "schema"
+schema_version = "wtqrk.scan/1"
+required_root_fields = ["schema", "mode", "compute", "image_width", "image_height",
+                        "mutations_tried", "budget_exhausted", "detection_count",
+                        "detections_found", "detections_truncated", "payloads_truncated",
+                        "payloads", "detections"]
+
+[[detections]]
+# The engine emits no code (gap no-finding-code); this is the code its consumer raises, so a
+# rule written against the contract matches what Loadout produces.
+code = "qr_code_decoded"
+severity = "low"
+source = "payload.fields.payloads[] (one decoded string per barcode, at most 256, each at most 4096 chars; per-barcode symbology/confidence/bbox in payload.fields.detections.<i>)"
+description = "A barcode/QR decoded from the image. The output carries the decoded text only. Loadout raises qr_code_decoded at severity 20, or 40 when a payload is an http(s) URL (on its own word scale low is 30 and medium 50, so both sit just below those words); the engine itself neither codes nor classifies the payload."
+
+[[gaps]]
+id = "no-finding-code"
+description = "Decoded barcodes are bare strings in payloads[]: no stable finding code, no URL/text classification, no severity. The consumer decides all three (Loadout synthesizes qr_code_decoded and its own http(s) test)."
+
+[[gaps]]
+id = "partial-sweep-is-ok"
+description = "A scan that ran out of time budget is status ok with budget_exhausted=true and warning scan_budget_exhausted; an empty payloads[] then is not a full sweep and must not be read as 'no QR'."
+
+[[gaps]]
+id = "first-hit-ends-sweep"
+description = "The scan stops early: any decode on the raw image returns before a single mutation runs (mutations_tried=0), in both modes, and default mode also returns at the first mutation that finds a new barcode. That result is status ok with budget_exhausted=false and no warning, so a non-empty payloads[] does not mean every barcode in the image was found: a benign decoy that decodes raw hides one that only a mutation would decode. Only an empty, non-exhausted scan has tried every mutation of its mode."
+
+[[gaps]]
+id = "detections-keyed-record"
+description = "Per-barcode detail is a Record keyed by decimal strings (\"0\", \"1\", ...) rather than a list; payloads[i] and detections.<i> correspond only by index."
+
+[[gaps]]
+id = "loadout-ignores-budget-and-truncation"
+description = "Loadout's williamtells_scan_evidence on its released bases marks a scan complete without reading budget_exhausted, detections_truncated / payloads_truncated (or detections_found vs detection_count) or the warnings, so a partial or truncated scan is reported as complete coverage. Fixed on Loadout's feat/engine-contract branch (89464569, 'read wtqrk 5e3457a's truncation, budget and per-barcode records'); this gap closes when that lands."
+
+[[gaps]]
+id = "loadout-ignores-structured-detections"
+description = "Loadout's released mapper reads only payloads[]; symbology, confidence, bounding boxes, mode, compute and mutations_tried are not mapped. Fixed on Loadout's feat/engine-contract branch (89464569: per-barcode symbology/confidence/bbox on each artifact, scan measurements); this gap closes when that lands."
+
+[[gaps]]
+id = "loadout-skips-pdf-svg"
+description = "The engine accepts pdf and svg, but Loadout's manifest accept_mime / routing rules (WT_IMAGE_MIMES) cover only raster images, so PDFs and SVGs are never routed to it."
+
+[[consumers]]
+name = "loadout"
+engine = "williamtells"
+mapper = "backend/loadout/engines.py:williamtells_results"
+emits = ["url", "qr_code", "detection"]

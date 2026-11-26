@@ -107,9 +107,62 @@ def sniff(head: bytes) -> tuple[str, str]:
     return "unknown", "application/octet-stream"
 
 
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"non-finite number {name}")
+
+
+# Foundation's JSONSerialization refuses nesting deeper than this.
+_MAX_JSON_DEPTH = 512
+
+
+def _bounded_int(text: str) -> int:
+    # Foundation's JSONSerialization takes any integer that is finite as a Double (up to 309
+    # digits) and refuses the rest; math.isfinite would overflow on those.
+    if len(text.lstrip("-")) > 309:
+        raise ValueError("integer too large")
+    v = int(text)
+    try:
+        float(v)
+    except OverflowError:
+        raise ValueError("integer too large") from None
+    return v
+
+
+def _depth(doc: Any) -> int:
+    """Container nesting depth, level by level, stopping once past the limit."""
+    depth, level = 0, [doc] if isinstance(doc, (dict, list)) else []
+    while level and depth <= _MAX_JSON_DEPTH:
+        depth += 1
+        level = [c for n in level for c in (n.values() if isinstance(n, dict) else n)
+                 if isinstance(c, (dict, list))]
+    return depth
+
+
+def _finite_float(text: str) -> float:
+    v = float(text)
+    if not math.isfinite(v):
+        raise ValueError(f"non-finite number {text[:32]}")
+    return v
+
+
+def _strict_json(raw: str | bytes) -> Any:
+    """``json.loads`` refusing what Foundation's JSONSerialization (the native agent's parser)
+    refuses: NaN/Infinity, numbers that overflow, lone surrogates, and nesting deep enough to
+    exhaust the stack. All of it raises ValueError, so both agents call it bad output."""
+    try:
+        doc = json.loads(raw, parse_constant=_no_constant, parse_int=_bounded_int,
+                         parse_float=_finite_float)
+        json.dumps(doc, ensure_ascii=False).encode("utf-8")
+    except (RecursionError, UnicodeEncodeError) as exc:
+        raise ValueError(f"unacceptable JSON ({type(exc).__name__})") from None
+    if _depth(doc) > _MAX_JSON_DEPTH:
+        raise ValueError(f"JSON nested deeper than {_MAX_JSON_DEPTH}")
+    return doc
+
+
 def _validate_config(raw: str) -> str:
     """Parse WTQRK_CONFIG strictly; return canonical JSON. ValueError on anything odd."""
-    cfg = json.loads(raw)
+    cfg = _strict_json(raw)
     if not isinstance(cfg, dict) or not set(cfg) <= _CONFIG_KEYS:
         raise ValueError(f"WTQRK_CONFIG must be an object with keys from {sorted(_CONFIG_KEYS)}")
     for key, values in cfg.items():
@@ -138,6 +191,11 @@ def _int(v: Any, lo: int, hi: int) -> int:
 def _str(v: Any, limit: int) -> tuple[str, bool]:
     if not isinstance(v, str):
         raise ValueError(f"not a string: {type(v).__name__}")
+    try:
+        v.encode("utf-8")
+    except UnicodeEncodeError:
+        # json.loads keeps a lone surrogate (\ud800); the envelope could not be serialized.
+        raise ValueError("string is not valid Unicode (lone surrogate)") from None
     return (v[:limit], len(v) > limit)
 
 
@@ -157,7 +215,7 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
     """
     if len(stdout) > MAX_STDOUT_BYTES:
         raise ValueError(f"scanner output exceeds {MAX_STDOUT_BYTES} bytes")
-    doc = json.loads(stdout)
+    doc = _strict_json(stdout)
     if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
         raise ValueError("scanner output has the wrong schema")
     input_type = doc.get("inputType")
@@ -168,7 +226,11 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
     report = doc.get("report")
     if not isinstance(report, dict):
         raise ValueError("report missing")
-    dims = report.get("imageDimensions") or {}
+    dims = report.get("imageDimensions")
+    if dims is None:
+        dims = {}
+    if not isinstance(dims, dict):
+        raise ValueError("imageDimensions must be an object")
     warnings: list[Warning] = []
     raw_dets = report.get("detections")
     if not isinstance(raw_dets, list):
@@ -177,6 +239,7 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
         warnings.append(Warning(code="detections_truncated",
                                 message=f"kept {MAX_DETECTIONS} of {len(raw_dets)} detections"))
     dets = []
+    payloads_cut = False
     for d in raw_dets[:MAX_DETECTIONS]:
         if not isinstance(d, dict):
             raise ValueError("detection must be an object")
@@ -184,6 +247,7 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
         if cut:
             warnings.append(Warning(code="payload_truncated",
                                     message=f"a payload was cut to {MAX_PAYLOAD_CHARS} chars"))
+        payloads_cut = payloads_cut or cut
         bb = d.get("boundingBox")
         if not isinstance(bb, dict):
             raise ValueError("boundingBox must be an object")
@@ -197,6 +261,7 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
             "bbox_y": _num(bb.get("y"), -10.0, 10.0),
             "bbox_w": _num(bb.get("width"), 0.0, 10.0),
             "bbox_h": _num(bb.get("height"), 0.0, 10.0),
+            "payload_truncated": cut,
         })
     exhausted = report.get("budgetExhausted", False)
     if exhausted is None:
@@ -215,6 +280,11 @@ def parse_scan_output(stdout: bytes) -> tuple[dict[str, Any], list[Warning]]:
         "image_height": _int(dims.get("height"), 1, 1 << 20),
         "mutations_tried": _int(report.get("mutationsTried"), 0, MAX_MUTATIONS_TRIED),
         "budget_exhausted": exhausted,
+        # The cuts above, in the result itself rather than only in warnings: detection_count
+        # is the KEPT count, so a consumer needs the found count to see a truncated scan.
+        "detections_found": len(raw_dets),
+        "detections_truncated": len(raw_dets) > MAX_DETECTIONS,
+        "payloads_truncated": payloads_cut,
         "detections": dets,
         "input_type": input_type,
     }
@@ -360,8 +430,12 @@ class WilliamTellsEngine:
 
         if doc.get("ok") is not True:
             err = doc.get("error") if isinstance(doc.get("error"), dict) else {}
-            code = str(err.get("code", "scan_failed"))[:64]
-            msg = str(err.get("message", ""))[:2000]
+            # As the native agent: a missing, empty or non-string code is scan_failed, and a
+            # non-string message is empty.
+            code = err.get("code")
+            code = code[:64] if isinstance(code, str) and code else "scan_failed"
+            msg = err.get("message")
+            msg = msg[:2000] if isinstance(msg, str) else ""
             status = "rejected" if r.exit_code in (2, 3) else "engine_error"
             return error(code, msg, status=status)
         if r.exit_code != 0:
@@ -383,6 +457,9 @@ class WilliamTellsEngine:
             "mutations_tried": doc["mutations_tried"],
             "budget_exhausted": doc["budget_exhausted"],
             "detection_count": len(dets),
+            "detections_found": doc["detections_found"],
+            "detections_truncated": doc["detections_truncated"],
+            "payloads_truncated": doc["payloads_truncated"],
             "payloads": [d["payload"] for d in dets],
             "detections": Record(fields={
                 str(i): Record(fields=d) for i, d in enumerate(dets)

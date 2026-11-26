@@ -61,7 +61,11 @@ public enum BlastboxEnvelope {
         func env(status: String, fields: [String: Any], warnings: [ScanWarning]) -> [String: Any] {
             ["engine": engine, "status": status, "input_sha256": inputSHA256, "detected": detected,
              "artifacts": [Any](),
-             "warnings": warnings.map { ["code": String($0.code.prefix(64)), "message": String($0.message.prefix(2000))] },
+             // Cut by code point, the unit blastbox's Warning limits count (code 1...64,
+             // message <= 2000); a grapheme cut lets combining marks through and the host's
+             // re-validation then fails the job.
+             "warnings": warnings.map { ["code": ScanOutputValidator.clip($0.code.isEmpty ? status : $0.code, 64),
+                                         "message": ScanOutputValidator.clip($0.message, 2000)] },
              "payload": ["_type": "record", "fields": fields]]
         }
         switch outcome {
@@ -71,6 +75,7 @@ public enum BlastboxEnvelope {
                 dets[String(i)] = ["_type": "record", "fields": [
                     "payload": d.payload, "symbology": d.symbology, "confidence": d.confidence,
                     "bbox_x": d.bboxX, "bbox_y": d.bboxY, "bbox_w": d.bboxW, "bbox_h": d.bboxH,
+                    "payload_truncated": d.payloadTruncated,
                 ] as [String: Any]]
             }
             return env(status: "ok", fields: [
@@ -78,20 +83,24 @@ public enum BlastboxEnvelope {
                 "image_width": scan.imageWidth, "image_height": scan.imageHeight,
                 "mutations_tried": scan.mutationsTried, "detection_count": scan.detections.count,
                 "budget_exhausted": scan.budgetExhausted,
+                "detections_found": scan.found, "detections_truncated": scan.detectionsTruncated,
+                "payloads_truncated": scan.payloadsTruncated,
                 "payloads": scan.detections.map(\.payload),
                 "detections": ["_type": "record", "fields": dets],
             ], warnings: warnings)
         case .rejected(let code, let message):
-            return env(status: "rejected", fields: ["schema": schema, "error": String(code.prefix(64))],
+            return env(status: "rejected", fields: ["schema": schema, "error": ScanOutputValidator.clip(code, 64)],
                        warnings: [ScanWarning(code: code, message: message)])
         case .engineError(let code, let message):
-            return env(status: "engine_error", fields: ["schema": schema, "error": String(code.prefix(64))],
+            return env(status: "engine_error", fields: ["schema": schema, "error": ScanOutputValidator.clip(code, 64)],
                        warnings: [ScanWarning(code: code, message: message)])
         }
     }
 
     public static func metadataJSON(_ envelope: [String: Any]) throws -> Data {
-        try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
+        // No "\/" escaping: the Python harness writes "/" as is, and escaping can double a
+        // slash-heavy result past the host's metadata cap.
+        try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys, .withoutEscapingSlashes])
     }
 
     /// A ustar archive holding exactly one regular file.

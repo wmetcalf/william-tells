@@ -492,6 +492,22 @@ start, so restart the agent after a macOS update.
 App-Sandboxed process; about 135 ms per request at `wtqrk-worker`. (Python `http_agent`:
 153 ms under `seatbelt`, 95 ms under `appsandbox`.)
 
+## Engine contract
+
+[`blastbox-engine.toml`](blastbox-engine.toml) states what the `williamtells` engine emits (both
+the Python engine and the native `wtqrk-worker`): no artifacts, a `wtqrk.scan/1` `record`
+payload with its required fields, the decoded-QR finding, the gaps a consumer must know about
+(a budget-exhausted sweep is still `ok`, released Loadout ignores the truncation flags, ...), and Loadout's
+mapper. Every result the tests produce is checked against it (`python/tests/conftest.py`).
+
+```bash
+python -m blastbox.contract.engine_contract validate blastbox-engine.toml
+python -m blastbox.contract.engine_contract check blastbox-engine.toml metadata.json
+```
+
+The checker ships in blastbox 0.1.49, which `python/pyproject.toml` requires; the tests import it
+directly, so an older blastbox fails test collection rather than silently skipping the contract.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
