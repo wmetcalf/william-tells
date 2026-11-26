@@ -3,7 +3,8 @@
 # (static pool) over https + mTLS, and only that Mac decodes the image, inside its sandbox.
 #
 # blastbox and william-tells are pinned to releases so the dispatcher and the Mac's http_agent speak
-# the same protocol. Bump them together with the Mac.
+# the same protocol. Bump them together with the Mac. Every william-tells release after v0.2.1
+# requires blastbox >= 0.1.49 (python/tests/test_deploy_pins.py holds the two pins to that).
 ARG BASE_IMAGE=python:3.12-slim-bookworm
 FROM ${BASE_IMAGE}
 

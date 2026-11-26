@@ -5,15 +5,13 @@ import dataclasses
 import json
 from pathlib import Path
 
+import blastbox.contract.engine_contract as ec
 import pytest
+from blastbox.contract import Record
+from blastbox.limits import Limits
+from blastbox.worker.sandbox.base import SandboxResult
 
-import blastbox.contract.engine_contract as ec  # noqa: E402
-
-from blastbox.contract import Record  # noqa: E402
-from blastbox.limits import Limits  # noqa: E402
-from blastbox.worker.sandbox.base import SandboxResult  # noqa: E402
-
-from william_tells import blastbox_engine as wt  # noqa: E402
+from william_tells import blastbox_engine as wt
 
 CONTRACT_PATH = Path(__file__).resolve().parents[2] / "blastbox-engine.toml"
 
