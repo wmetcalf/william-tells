@@ -312,7 +312,7 @@ can run on the Mac (Mac-only) or on Linux next to the other engines, with Macs a
 
 | Path | What |
 |---|---|
-| `Sources/wtqrk-scan/` | One-shot CLI: `scan <image>` → one JSON document on stdout; `blastbox <image\|->` → the finished blastbox `metadata.json` envelope (scans in-process, so a pull agent's sandbox covers the mapping; takes `WTQRK_MODE`/`WTQRK_CONFIG` as env fallbacks for `--heavy`/`--config-json`; exits 0 even for `rejected`/`engine_error` envelopes); `self-test`; `render-qr`; `devices`. No Vapor. |
+| `Sources/wtqrk-scan/` | One-shot CLI: `scan <image>` → one JSON document on stdout; `blastbox <image\|->` → the finished blastbox `metadata.json` envelope (scans in-process, so a pull agent's sandbox covers the mapping; runs the known-QR self-test in-process first and seals `self_test_failed` when it fails; takes `WTQRK_MODE`/`WTQRK_CONFIG` as env fallbacks for `--heavy`/`--config-json`, rejecting a malformed one even when a flag overrides it; `--budget-ms` defaults to the 120 s job timeout's budget and `--max-bytes` to 100 MiB, and an over-limit input is still hashed so its `input_sha256` is real; exits 0 even for `rejected`/`engine_error` envelopes); `self-test`; `render-qr`; `devices`. No Vapor. |
 | `Sources/QRScanCore/` | The scanner and models, shared by the Vapor service and the CLI. Raster input goes through an ImageIO type allowlist and a 100 M-pixel cap checked before decode. |
 | `Sources/QRSandbox/` | The native sandbox: slots, the per-image runner, the self-test/confinement gate, output validation, the blastbox envelope. |
 | `Sources/wtqrk-worker/` | Native blastbox worker agent (`GET /healthz`, `POST /detonate`). |

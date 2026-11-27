@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Testing
 import QRScanCore
 @testable import QRSandbox
@@ -36,6 +37,11 @@ import QRScanCore
         #expect(try status(BlastboxMode.outcome(of: failed("invalid_image"), exit: .badInput)) == "rejected")
         #expect(try status(BlastboxMode.outcome(of: failed("bad_config"), exit: .badConfig)) == "rejected")
         #expect(try status(BlastboxMode.outcome(of: failed("scan_failed"), exit: .failure)) == "engine_error")
+        // The scanner's own code is carried, as the push path does.
+        guard case .rejected(let rc, _) = BlastboxMode.outcome(of: failed("invalid_image"), exit: .badInput),
+              case .engineError(let ec, _) = BlastboxMode.outcome(of: failed("scan_failed"), exit: .failure)
+        else { Issue.record("unexpected outcome"); return }
+        #expect(rc == "invalid_image" && ec == "scan_failed")
     }
 
     @Test func anOkDocumentWithANonzeroExitIsNotATrustedResult() throws {
@@ -80,8 +86,80 @@ import QRScanCore
     @Test func aBadEnvConfigIsARejectedEnvelopeWithExitZero() async throws {
         let (c, e) = try await run(env: ["WTQRK_CONFIG": "garbage"])
         #expect(c == .ok && e?["status"] as? String == "rejected")
-        let (_, flagWins) = try await run(["--config-json", #"{"scales":[1]}"#], env: ["WTQRK_CONFIG": "garbage"])
+        let (_, flagWins) = try await run(["--config-json", #"{"scales":[1]}"#], env: ["WTQRK_CONFIG": #"{"scales":[2]}"#])
         #expect(flagWins?["status"] as? String == "ok")
+        // A malformed env param is rejected even when a flag overrides it (as the push path does).
+        let (_, overridden) = try await run(["--config-json", #"{"scales":[1]}"#], env: ["WTQRK_CONFIG": "garbage"])
+        #expect(overridden?["status"] as? String == "rejected")
+    }
+
+    /// Runs `blastbox` on `bytes` written to a temp file; returns (exit, raw output).
+    func runOn(_ bytes: Data, _ extra: [String] = [], env: [String: String] = [:],
+               mode: Int16? = nil) async throws -> (ScanExit, Data) {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString).bin")
+        try bytes.write(to: path)
+        if let mode { try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: path.path) }
+        defer { try? FileManager.default.removeItem(at: path) }
+        var out = Data()
+        let code = await runBlastbox(ArraySlice([path.path] + extra), env: env, write: { out.append($0); return true })
+        return (code, out)
+    }
+
+    @Test func aTooLargeInputCarriesItsRealSHA256SoTheTrustGateAcceptsIt() async throws {
+        let bytes = Data((0..<100).map { UInt8($0) })
+        let (c, out) = try await runOn(bytes, ["--max-bytes", "10"])
+        let e = try #require(try JSONSerialization.jsonObject(with: out) as? NSDictionary)
+        let want = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        #expect(c == .ok && e["status"] as? String == "rejected")
+        #expect(e["input_sha256"] as? String == want)
+    }
+
+    @Test func aMalformedMaxBytesIsAUsageErrorNotASilentDefault() async throws {
+        for bad in ["10MB", "0", "-1", "99999999999999999999"] {
+            let (c, out) = try await runOn(Data([1, 2, 3]), ["--max-bytes", bad])
+            #expect(c == .usage && out.isEmpty, "--max-bytes \(bad)")
+        }
+    }
+
+    @Test func aBadEnvModeIsRejectedEvenWhenTheHeavyFlagIsGiven() async throws {
+        let (c, e) = try await run(["--heavy"], env: ["WTQRK_MODE": "evil"])
+        #expect(c == .ok && e?["status"] as? String == "rejected")
+    }
+
+    @Test func anUnreadableFileIsRejectedLikeTheScanPath() async throws {
+        guard getuid() != 0 else { return }       // root reads a 000 file
+        let (c, out) = try await runOn(Data([1, 2, 3]), env: [:], mode: 0o000)
+        let e = try #require(try JSONSerialization.jsonObject(with: out) as? NSDictionary)
+        #expect(c == .ok && e["status"] as? String == "rejected")
+    }
+
+    @Test func aFailedSelfTestIsASealedEngineErrorAndTheInputIsNeverScanned() async throws {
+        var scanned = false
+        var out = Data()
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString).png")
+        try #require(ScanJob.qrPNG("x")).write(to: path)
+        defer { try? FileManager.default.removeItem(at: path) }
+        let code = await runBlastbox([path.path], env: [:], write: { out.append($0); return true },
+                                     selfTest: { _ in (false, "vision denied") },
+                                     scan: { r in scanned = true; return await blastboxScan(r) })
+        let e = try #require(try JSONSerialization.jsonObject(with: out) as? NSDictionary)
+        let w = try #require((e["warnings"] as? [NSDictionary])?.first)
+        #expect(code == .ok && e["status"] as? String == "engine_error" && !scanned)
+        #expect(w["code"] as? String == "self_test_failed")
+    }
+
+    @Test func theScanGetsTheDefaultBudgetAndTheFlagConfig() async throws {
+        var seen: BlastboxScanRequest?
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString).png")
+        try #require(ScanJob.qrPNG("x")).write(to: path)
+        defer { try? FileManager.default.removeItem(at: path) }
+        _ = await runBlastbox([path.path, "--config-json", #"{"scales":[1]}"#],
+                              env: ["WTQRK_CONFIG": #"{"scales":[2]}"#, "WTQRK_MODE": "heavy"],
+                              write: { _ in true }, selfTest: { _ in (true, "") },
+                              scan: { r in seen = r; return await blastboxScan(r) })
+        let r = try #require(seen)
+        #expect(r.budget == ScanJob.budget(forTimeout: 120) && r.heavy)
+        #expect(r.configJSON == (try ScanOutputValidator.canonicalConfig(#"{"scales":[1]}"#)))
     }
 
     @Test func aFailedWriteIsAFailureExit() async throws {
