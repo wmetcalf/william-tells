@@ -1,0 +1,64 @@
+{
+  "artifacts": [],
+  "detected": {
+    "confidence": 1.0,
+    "label": "png",
+    "mime": "image/png",
+    "source": "williamtells"
+  },
+  "engine": "williamtells",
+  "input_sha256": "abababababababababababababababababababababababababababababababab",
+  "payload": {
+    "_type": "record",
+    "fields": {
+      "budget_exhausted": false,
+      "compute": "auto",
+      "detection_count": 2,
+      "detections": {
+        "_type": "record",
+        "fields": {
+          "0": {
+            "_type": "record",
+            "fields": {
+              "bbox_h": 0.375,
+              "bbox_w": 0.5,
+              "bbox_x": 0.125,
+              "bbox_y": 0.25,
+              "confidence": 1.0,
+              "payload": "https://example.test/a?b=c/d",
+              "payload_truncated": false,
+              "symbology": "VNBarcodeSymbologyQR"
+            }
+          },
+          "1": {
+            "_type": "record",
+            "fields": {
+              "bbox_h": 0.25,
+              "bbox_w": 0.25,
+              "bbox_x": 0.0,
+              "bbox_y": 0.0,
+              "confidence": 0.5,
+              "payload": "second \u00e9",
+              "payload_truncated": false,
+              "symbology": "VNBarcodeSymbologyQR"
+            }
+          }
+        }
+      },
+      "detections_found": 2,
+      "detections_truncated": false,
+      "image_height": 250,
+      "image_width": 390,
+      "mode": "default",
+      "mutations_tried": 3,
+      "payloads": [
+        "https://example.test/a?b=c/d",
+        "second \u00e9"
+      ],
+      "payloads_truncated": false,
+      "schema": "wtqrk.scan/1"
+    }
+  },
+  "status": "ok",
+  "warnings": []
+}
