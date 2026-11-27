@@ -237,7 +237,12 @@ func readHashed(_ path: String, maxBytes: Int) throws -> HashedInput {
 /// The in-process known-QR self-test: when the caller's sandbox denies something Vision needs,
 /// a scan finds nothing instead of failing, so no result is trusted until a generated QR decodes
 /// in this very process (the push path's `self_test_failed` gate).
-func blastboxSelfTest(_ compute: ComputePreference) async -> (ok: Bool, detail: String) {
+/// Like the push path's gate it also requires that the kernel has this process sandboxed: the
+/// caller owns the sandbox, and a hostile image is never parsed outside one.
+func blastboxSelfTest(_ compute: ComputePreference, requireSandbox: Bool = true) async -> (ok: Bool, detail: String) {
+    if requireSandbox && sandbox_check(getpid(), nil, 0) == 0 {
+        return (false, "this process is not sandboxed; run it under the caller's sandbox")
+    }
     let out = await ScanJob.selfTest(compute: compute == .auto ? nil : compute, sandboxed: nil)
     let detail = out.cases.map { "\($0.compute): ok=\($0.ok)\($0.error.map { " error=\($0)" } ?? "")" }
         .joined(separator: "; ")
@@ -261,10 +266,10 @@ func blastboxScan(_ r: BlastboxScanRequest) async -> (ScanOutput, ScanExit) {
 /// `wtqrk-scan blastbox`: scan in this process, print the blastbox envelope.
 func runBlastbox(_ argv: ArraySlice<String>, env: [String: String] = ProcessInfo.processInfo.environment,
                  write: (Data) -> Bool = writeResult,
-                 selfTest: (ComputePreference) async -> (ok: Bool, detail: String) = blastboxSelfTest,
+                 selfTest: (ComputePreference) async -> (ok: Bool, detail: String) = { await blastboxSelfTest($0) },
                  scan: (BlastboxScanRequest) async -> (ScanOutput, ScanExit) = blastboxScan)
     async -> ScanExit {
-    let started = Date()
+    let started = ProcessInfo.processInfo.systemUptime   // monotonic: a clock step can't stretch it
     guard let args = Args(argv, valued: ["--config-json", "--compute", "--max-bytes", "--budget-ms"],
                           booleans: ["--heavy"]),
           args.positional.count == 1,
@@ -340,7 +345,9 @@ func runBlastbox(_ argv: ArraySlice<String>, env: [String: String] = ProcessInfo
 
     // The budget counts from process start: the read, hash and self-test above ran inside the
     // same job deadline the sweep has to finish in.
-    let remaining = max(1, budget - Date().timeIntervalSince(started))
+    // Once it is spent the scan still gets a sliver: it then returns its minimum pass, flagged
+    // budget_exhausted, instead of no envelope at all.
+    let remaining = max(0.001, budget - (ProcessInfo.processInfo.systemUptime - started))
     let (out, code) = await scan(BlastboxScanRequest(data: data, heavy: heavy, configJSON: config,
                                                      compute: compute, budget: remaining))
     return finish(BlastboxMode.outcome(of: out, exit: code), sha: sha, head: head)

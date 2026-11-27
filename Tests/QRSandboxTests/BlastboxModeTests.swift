@@ -53,6 +53,11 @@ import QRScanCore
     }
 }
 
+/// The real known-QR decode gate, minus the sandbox requirement (`swift test` is unsandboxed).
+func unsandboxedSelfTest(_ c: ComputePreference) async -> (ok: Bool, detail: String) {
+    await blastboxSelfTest(c, requireSandbox: false)
+}
+
 @Suite struct BlastboxCLITests {
     /// Runs `blastbox` on a rendered QR with an injected env; returns (exit, parsed envelope).
     func run(_ extra: [String] = [], env: [String: String]) async throws -> (ScanExit, NSDictionary?) {
@@ -62,7 +67,8 @@ import QRScanCore
         try png.write(to: path)
         defer { try? FileManager.default.removeItem(at: path) }
         var out = Data()
-        let code = await runBlastbox(ArraySlice([path.path] + extra), env: env, write: { out.append($0); return true })
+        let code = await runBlastbox(ArraySlice([path.path] + extra), env: env, write: { out.append($0); return true },
+                                     selfTest: unsandboxedSelfTest)
         return (code, try? JSONSerialization.jsonObject(with: out) as? NSDictionary)
     }
     func mode(_ e: NSDictionary?) -> String? {
@@ -101,7 +107,8 @@ import QRScanCore
         if let mode { try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: path.path) }
         defer { try? FileManager.default.removeItem(at: path) }
         var out = Data()
-        let code = await runBlastbox(ArraySlice([path.path] + extra), env: env, write: { out.append($0); return true })
+        let code = await runBlastbox(ArraySlice([path.path] + extra), env: env, write: { out.append($0); return true },
+                                     selfTest: unsandboxedSelfTest)
         return (code, out)
     }
 
@@ -170,7 +177,8 @@ import QRScanCore
         try #require(ScanJob.qrPNG("https://example.test/link")).write(to: real)
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
         var out = Data()
-        let code = await runBlastbox([link.path], env: [:], write: { out.append($0); return true })
+        let code = await runBlastbox([link.path], env: [:], write: { out.append($0); return true },
+                                     selfTest: unsandboxedSelfTest)
         let e = try #require(try JSONSerialization.jsonObject(with: out) as? NSDictionary)
         #expect(code == .ok && e["status"] as? String == "ok")
     }
@@ -180,7 +188,8 @@ import QRScanCore
         try #require(mkfifo(path.path, 0o600) == 0)
         defer { try? FileManager.default.removeItem(at: path) }
         var out = Data()
-        let code = await runBlastbox([path.path], env: [:], write: { out.append($0); return true })
+        let code = await runBlastbox([path.path], env: [:], write: { out.append($0); return true },
+                                     selfTest: unsandboxedSelfTest)
         let e = try #require(try JSONSerialization.jsonObject(with: out) as? NSDictionary)
         #expect(code == .ok && e["status"] as? String == "rejected")
     }
@@ -197,12 +206,31 @@ import QRScanCore
         #expect(r.budget <= 8.6 && r.budget >= 1)
     }
 
+    @Test func theSelfTestFailsWhenThisProcessIsNotSandboxed() async throws {
+        // `swift test` runs unsandboxed: the push path's gate refuses that, so this one must too.
+        let gate = await blastboxSelfTest(.auto)
+        #expect(!gate.ok && gate.detail.contains("not sandboxed"))
+        #expect(await blastboxSelfTest(.auto, requireSandbox: false).ok)
+    }
+
+    @Test func aSubSecondBudgetIsHonoured() async throws {
+        var seen: BlastboxScanRequest?
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString).png")
+        try #require(ScanJob.qrPNG("x")).write(to: path)
+        defer { try? FileManager.default.removeItem(at: path) }
+        _ = await runBlastbox([path.path, "--budget-ms", "200"], env: [:], write: { _ in true },
+                              selfTest: { _ in (true, "") },
+                              scan: { r in seen = r; return await blastboxScan(r) })
+        let r = try #require(seen)
+        #expect(r.budget <= 0.2 && r.budget > 0)
+    }
+
     @Test func aFailedWriteIsAFailureExit() async throws {
         let png = try #require(ScanJob.qrPNG("x"))
         let path = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString).png")
         try png.write(to: path)
         defer { try? FileManager.default.removeItem(at: path) }
-        let code = await runBlastbox([path.path], env: [:], write: { _ in false })
+        let code = await runBlastbox([path.path], env: [:], write: { _ in false }, selfTest: unsandboxedSelfTest)
         #expect(code == .failure)
     }
 }
