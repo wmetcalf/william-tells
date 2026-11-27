@@ -201,10 +201,16 @@ struct HashedInput {
 func readHashed(_ path: String, maxBytes: Int) throws -> HashedInput {
     var fd = STDIN_FILENO
     if path != "-" {
-        let attrs = try FileManager.default.attributesOfItem(atPath: path)
-        guard (attrs[.type] as? FileAttributeType) == .typeRegular else { throw ReadError.notRegular }
-        fd = open(path, O_RDONLY | O_NOFOLLOW)
+        // Follow links like `scan` does, but judge the file by the descriptor actually opened (no
+        // stat-then-open race), and open non-blocking so a FIFO can't hang us before that check.
+        fd = open(path, O_RDONLY | O_NONBLOCK)
         if fd < 0 { throw ReadError.io(String(cString: strerror(errno))) }
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else {
+            close(fd)
+            throw ReadError.notRegular
+        }
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK)
     }
     defer { if fd != STDIN_FILENO { close(fd) } }
     var hasher = SHA256()
@@ -258,6 +264,7 @@ func runBlastbox(_ argv: ArraySlice<String>, env: [String: String] = ProcessInfo
                  selfTest: (ComputePreference) async -> (ok: Bool, detail: String) = blastboxSelfTest,
                  scan: (BlastboxScanRequest) async -> (ScanOutput, ScanExit) = blastboxScan)
     async -> ScanExit {
+    let started = Date()
     guard let args = Args(argv, valued: ["--config-json", "--compute", "--max-bytes", "--budget-ms"],
                           booleans: ["--heavy"]),
           args.positional.count == 1,
@@ -331,8 +338,11 @@ func runBlastbox(_ argv: ArraySlice<String>, env: [String: String] = ProcessInfo
                       sha: sha, head: head)
     }
 
+    // The budget counts from process start: the read, hash and self-test above ran inside the
+    // same job deadline the sweep has to finish in.
+    let remaining = max(1, budget - Date().timeIntervalSince(started))
     let (out, code) = await scan(BlastboxScanRequest(data: data, heavy: heavy, configJSON: config,
-                                                     compute: compute, budget: budget))
+                                                     compute: compute, budget: remaining))
     return finish(BlastboxMode.outcome(of: out, exit: code), sha: sha, head: head)
 }
 

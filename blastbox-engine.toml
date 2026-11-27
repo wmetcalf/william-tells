@@ -1,6 +1,9 @@
 # Engine output contract for `williamtells` (schema blastbox-engine-contract/1).
-# Describes what python/william_tells/blastbox_engine.py and the native Swift agent
-# (Sources/QRSandbox/BlastboxEnvelope.swift) emit TODAY; both produce the same envelope.
+# Describes what python/william_tells/blastbox_engine.py, the native Swift agent
+# (Sources/QRSandbox/BlastboxEnvelope.swift) and `wtqrk-scan blastbox` (the pull path: scans
+# in-process under the caller's sandbox, same mapping) emit TODAY; all produce the same envelope.
+# `wtqrk-scan blastbox` defaults --max-bytes to 100 MiB and --budget-ms to the 120 s timeout's
+# budget (counted from process start), and runs the known-QR self-test in-process per run.
 # Validate: python -m blastbox.contract.engine_contract validate blastbox-engine.toml
 schema = "blastbox-engine-contract/1"
 
@@ -72,6 +75,10 @@ description = "Loadout's released mapper reads only payloads[]; symbology, confi
 [[gaps]]
 id = "loadout-skips-pdf-svg"
 description = "The engine accepts pdf and svg, but Loadout's manifest accept_mime / routing rules (WT_IMAGE_MIMES) cover only raster images, so PDFs and SVGs are never routed to it."
+
+[[gaps]]
+id = "pull-path-unhashable-input"
+description = "`wtqrk-scan blastbox` seals an input it cannot read at all (not a regular file, or a read error) as rejected with input_sha256 of 64 zeros, since no honest digest exists; the host's input_sha256 round trip then refuses that envelope. An over-limit (too_large) input is still hashed to its end, so it round-trips."
 
 [[consumers]]
 name = "loadout"

@@ -158,8 +158,43 @@ import QRScanCore
                               write: { _ in true }, selfTest: { _ in (true, "") },
                               scan: { r in seen = r; return await blastboxScan(r) })
         let r = try #require(seen)
-        #expect(r.budget == ScanJob.budget(forTimeout: 120) && r.heavy)
+        #expect(r.budget <= ScanJob.budget(forTimeout: 120) && r.budget > ScanJob.budget(forTimeout: 120) - 5 && r.heavy)
         #expect(r.configJSON == (try ScanOutputValidator.canonicalConfig(#"{"scales":[1]}"#)))
+    }
+
+    @Test func aSymlinkToARegularImageIsScannedLikeTheScanPath() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let real = dir.appendingPathComponent("real.png"), link = dir.appendingPathComponent("link.png")
+        try #require(ScanJob.qrPNG("https://example.test/link")).write(to: real)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+        var out = Data()
+        let code = await runBlastbox([link.path], env: [:], write: { out.append($0); return true })
+        let e = try #require(try JSONSerialization.jsonObject(with: out) as? NSDictionary)
+        #expect(code == .ok && e["status"] as? String == "ok")
+    }
+
+    @Test func aFIFOIsRejectedWithoutBlocking() async throws {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString).fifo")
+        try #require(mkfifo(path.path, 0o600) == 0)
+        defer { try? FileManager.default.removeItem(at: path) }
+        var out = Data()
+        let code = await runBlastbox([path.path], env: [:], write: { out.append($0); return true })
+        let e = try #require(try JSONSerialization.jsonObject(with: out) as? NSDictionary)
+        #expect(code == .ok && e["status"] as? String == "rejected")
+    }
+
+    @Test func theSelfTestsTimeComesOutOfTheScanBudget() async throws {
+        var seen: BlastboxScanRequest?
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString).png")
+        try #require(ScanJob.qrPNG("x")).write(to: path)
+        defer { try? FileManager.default.removeItem(at: path) }
+        _ = await runBlastbox([path.path, "--budget-ms", "10000"], env: [:], write: { _ in true },
+                              selfTest: { _ in try? await Task.sleep(nanoseconds: 1_500_000_000); return (true, "") },
+                              scan: { r in seen = r; return await blastboxScan(r) })
+        let r = try #require(seen)
+        #expect(r.budget <= 8.6 && r.budget >= 1)
     }
 
     @Test func aFailedWriteIsAFailureExit() async throws {
