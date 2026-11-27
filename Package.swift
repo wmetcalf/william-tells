@@ -71,7 +71,7 @@ let package = Package(
         ),
         .testTarget(
             name: "QRSandboxTests",
-            dependencies: ["QRSandbox"],
+            dependencies: ["QRSandbox", "wtqrk-scan"],
             path: "Tests/QRSandboxTests"
         ),
     ]

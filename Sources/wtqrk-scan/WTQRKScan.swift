@@ -162,8 +162,23 @@ func runScan(_ argv: ArraySlice<String>) async -> ScanExit {
     return code
 }
 
+/// Write all of `data` to the real stdout; false on a failed or short write (EINTR is retried).
+func writeResult(_ data: Data) -> Bool {
+    data.withUnsafeBytes { buf in
+        var off = 0
+        while off < buf.count {
+            let n = Foundation.write(resultFD, buf.baseAddress! + off, buf.count - off)
+            if n < 0 && errno == EINTR { continue }
+            if n <= 0 { return false }
+            off += n
+        }
+        return true
+    }
+}
+
 /// `wtqrk-scan blastbox`: scan in this process, print the blastbox envelope.
-func runBlastbox(_ argv: ArraySlice<String>, env: [String: String] = ProcessInfo.processInfo.environment) async -> ScanExit {
+func runBlastbox(_ argv: ArraySlice<String>, env: [String: String] = ProcessInfo.processInfo.environment,
+                 write: (Data) -> Bool = writeResult) async -> ScanExit {
     guard let args = Args(argv, valued: ["--config-json", "--compute", "--max-bytes", "--budget-ms"],
                           booleans: ["--heavy"]),
           args.positional.count == 1,
@@ -177,18 +192,15 @@ func runBlastbox(_ argv: ArraySlice<String>, env: [String: String] = ProcessInfo
     let maxBytes = Int(args.options["--max-bytes"] ?? "") ?? 50 * 1024 * 1024
 
     func finish(_ outcome: ScanOutcome, sha: String, head: Data) -> ScanExit {
-        guard let line = try? BlastboxMode.line(outcome: outcome, inputSHA256: sha, head: head) else {
-            return fail("envelope_failed", "could not serialise the envelope", .failure)
+        let line: Data
+        if let l = try? BlastboxMode.line(outcome: outcome, inputSHA256: sha, head: head) {
+            line = l
+        } else {
+            // Static document: nothing here can fail the way the mapping just did.
+            let doc: String = #"{"artifacts":[],"detected":{"confidence":0,"label":"unknown","mime":"application/octet-stream","source":"williamtells"},"engine":"williamtells","input_sha256":"\#(sha)","payload":{"_type":"record","fields":{"error":"envelope_failed","schema":"wtqrk.scan/1"}},"status":"engine_error","warnings":[{"code":"envelope_failed","message":"could not serialise the envelope"}]}"#
+            line = Data((doc + "\n").utf8)
         }
-        line.withUnsafeBytes { buf in
-            var off = 0
-            while off < buf.count {
-                let n = write(resultFD, buf.baseAddress! + off, buf.count - off)
-                if n <= 0 { break }
-                off += n
-            }
-        }
-        return .ok
+        return write(line) ? .ok : .failure
     }
 
     let data: Data
@@ -208,14 +220,14 @@ func runBlastbox(_ argv: ArraySlice<String>, env: [String: String] = ProcessInfo
     let head = data.prefix(1024)
 
     // Per-job parameters: flags win over the environment the blastbox agent forwards.
-    let envMode = (env["WTQRK_MODE"] ?? "default").trimmingCharacters(in: .whitespaces)
+    let envMode = (env["WTQRK_MODE"] ?? "default").trimmingCharacters(in: .whitespacesAndNewlines)
     guard ["default", "heavy", ""].contains(envMode) || args.flags.contains("--heavy") else {
         return finish(.rejected(code: "bad_param", message: "WTQRK_MODE must be default or heavy, not \(envMode.prefix(32))"),
                       sha: sha, head: head)
     }
     let heavy = args.flags.contains("--heavy") || envMode == "heavy"
     let rawConfig = args.options["--config-json"]
-        ?? env["WTQRK_CONFIG"].flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
+        ?? env["WTQRK_CONFIG"].flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
     var config: String?
     if let rawConfig {
         do { config = try ScanOutputValidator.canonicalConfig(rawConfig) }

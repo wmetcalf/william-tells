@@ -2,6 +2,7 @@ import Foundation
 import Testing
 import QRScanCore
 @testable import QRSandbox
+@testable import wtqrk_scan
 
 @Suite struct BlastboxModeTests {
     static let dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
@@ -43,5 +44,52 @@ import QRScanCore
             Issue.record("expected engineError"); return
         }
         #expect(code == "scanner_failed")
+    }
+}
+
+@Suite struct BlastboxCLITests {
+    /// Runs `blastbox` on a rendered QR with an injected env; returns (exit, parsed envelope).
+    func run(_ extra: [String] = [], env: [String: String]) async throws -> (ScanExit, NSDictionary?) {
+        let png = try #require(ScanJob.qrPNG("https://example.test/cli"))
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("blastbox-cli-\(UUID().uuidString).png")
+        try png.write(to: path)
+        defer { try? FileManager.default.removeItem(at: path) }
+        var out = Data()
+        let code = await runBlastbox(ArraySlice([path.path] + extra), env: env, write: { out.append($0); return true })
+        return (code, try? JSONSerialization.jsonObject(with: out) as? NSDictionary)
+    }
+    func mode(_ e: NSDictionary?) -> String? {
+        ((e?["payload"] as? NSDictionary)?["fields"] as? NSDictionary)?["mode"] as? String
+    }
+
+    @Test func envModeIsAFallbackAndAFlagWins() async throws {
+        let (c1, e1) = try await run(env: ["WTQRK_MODE": "heavy"])
+        #expect(c1 == .ok && e1?["status"] as? String == "ok" && mode(e1) == "heavy")
+        let (_, e2) = try await run(["--heavy"], env: [:])
+        #expect(mode(e2) == "heavy")
+        let (_, e3) = try await run(env: [:])
+        #expect(mode(e3) == "default")
+    }
+
+    @Test func aTrailingNewlineInWTQRKModeIsStripped() async throws {
+        let (c, e) = try await run(env: ["WTQRK_MODE": "heavy\n"])
+        #expect(c == .ok && mode(e) == "heavy")
+    }
+
+    @Test func aBadEnvConfigIsARejectedEnvelopeWithExitZero() async throws {
+        let (c, e) = try await run(env: ["WTQRK_CONFIG": "garbage"])
+        #expect(c == .ok && e?["status"] as? String == "rejected")
+        let (_, flagWins) = try await run(["--config-json", #"{"scales":[1]}"#], env: ["WTQRK_CONFIG": "garbage"])
+        #expect(flagWins?["status"] as? String == "ok")
+    }
+
+    @Test func aFailedWriteIsAFailureExit() async throws {
+        let png = try #require(ScanJob.qrPNG("x"))
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString).png")
+        try png.write(to: path)
+        defer { try? FileManager.default.removeItem(at: path) }
+        let code = await runBlastbox([path.path], env: [:], write: { _ in false })
+        #expect(code == .failure)
     }
 }
