@@ -237,10 +237,13 @@ func readHashed(_ path: String, maxBytes: Int) throws -> HashedInput {
 /// The in-process known-QR self-test: when the caller's sandbox denies something Vision needs,
 /// a scan finds nothing instead of failing, so no result is trusted until a generated QR decodes
 /// in this very process (the push path's `self_test_failed` gate).
+/// `sandbox_check` is 1 when sandboxed, 0 when not, and -1 on error: only 1 counts (fail closed).
+func sandboxCheckSaysSandboxed(_ rc: Int32) -> Bool { rc > 0 }
+
 /// Like the push path's gate it also requires that the kernel has this process sandboxed: the
 /// caller owns the sandbox, and a hostile image is never parsed outside one.
 func blastboxSelfTest(_ compute: ComputePreference, requireSandbox: Bool = true) async -> (ok: Bool, detail: String) {
-    if requireSandbox && sandbox_check(getpid(), nil, 0) == 0 {
+    if requireSandbox && !sandboxCheckSaysSandboxed(sandbox_check(getpid(), nil, 0)) {
         return (false, "this process is not sandboxed; run it under the caller's sandbox")
     }
     let out = await ScanJob.selfTest(compute: compute == .auto ? nil : compute, sandboxed: nil)

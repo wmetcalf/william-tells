@@ -213,6 +213,11 @@ func unsandboxedSelfTest(_ c: ComputePreference) async -> (ok: Bool, detail: Str
         #expect(await blastboxSelfTest(.auto, requireSandbox: false).ok)
     }
 
+    @Test func aSandboxCheckErrorIsNotSandboxed() {
+        #expect(sandboxCheckSaysSandboxed(1))
+        #expect(!sandboxCheckSaysSandboxed(0) && !sandboxCheckSaysSandboxed(-1))
+    }
+
     @Test func aSubSecondBudgetIsHonoured() async throws {
         var seen: BlastboxScanRequest?
         let path = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString).png")
