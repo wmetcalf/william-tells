@@ -7,10 +7,16 @@
 //
 //   wtqrk-scan scan <image|-> [--heavy] [--config-json JSON] [--compute auto|ane|gpu|cpu]
 //                           [--max-bytes N] [--budget-ms N]
+//   wtqrk-scan blastbox <image|-> [same options as scan]   (prints the sealed blastbox envelope)
 //   wtqrk-scan self-test [--compute auto|ane|gpu|cpu]
 //   wtqrk-scan devices
 //   wtqrk-scan probe --read <path> --connect <port>   (confinement check for a sandbox host)
 //   wtqrk-scan render-qr <message> <out.png>     (a known-positive sample for tests / ops)
+//
+// `blastbox` scans IN-PROCESS (the caller -- blastbox's pull agent -- provides the sandbox) and
+// prints exactly one blastbox `metadata.json` envelope, exiting 0 even for an engine_error /
+// rejected envelope (64 = usage only). WTQRK_MODE / WTQRK_CONFIG are fallbacks for --heavy /
+// --config-json; the flags win.
 //
 // `scan -` reads the image from stdin: the native sandbox host hands each scan an open file
 // descriptor, so the sandboxed process needs no file-path grant at all.
@@ -22,6 +28,8 @@
 // failure; 2 the input is not a usable image; 3 bad config; 64 usage.
 
 import Foundation
+import CryptoKit
+import QRSandbox
 import QRScanCore
 
 /// The ONLY channel for our JSON. Apple frameworks (E5RT, Espresso) print diagnostics straight
@@ -57,6 +65,7 @@ func fail(_ code: String, _ message: String, _ exit: ScanExit, mode: String? = n
 func usage() -> ScanExit {
     FileHandle.standardError.write(Data("""
     usage: wtqrk-scan scan <image|-> [--heavy] [--config-json JSON] [--compute auto|ane|gpu|cpu] [--max-bytes N] [--budget-ms N]
+           wtqrk-scan blastbox <image|-> [--heavy] [--config-json JSON] [--compute auto|ane|gpu|cpu] [--max-bytes N] [--budget-ms N]
            wtqrk-scan self-test [--compute auto|ane|gpu|cpu]
            wtqrk-scan devices
            wtqrk-scan render-qr <message> <out.png>
@@ -153,6 +162,71 @@ func runScan(_ argv: ArraySlice<String>) async -> ScanExit {
     return code
 }
 
+/// `wtqrk-scan blastbox`: scan in this process, print the blastbox envelope.
+func runBlastbox(_ argv: ArraySlice<String>, env: [String: String] = ProcessInfo.processInfo.environment) async -> ScanExit {
+    guard let args = Args(argv, valued: ["--config-json", "--compute", "--max-bytes", "--budget-ms"],
+                          booleans: ["--heavy"]),
+          args.positional.count == 1,
+          let compute = parseCompute(args.options["--compute"])
+    else { return usage() }
+    var budget: TimeInterval?
+    if let raw = args.options["--budget-ms"] {
+        guard let ms = Int(raw), ms > 0, ms <= 86_400_000 else { return usage() }
+        budget = TimeInterval(ms) / 1000
+    }
+    let maxBytes = Int(args.options["--max-bytes"] ?? "") ?? 50 * 1024 * 1024
+
+    func finish(_ outcome: ScanOutcome, sha: String, head: Data) -> ScanExit {
+        guard let line = try? BlastboxMode.line(outcome: outcome, inputSHA256: sha, head: head) else {
+            return fail("envelope_failed", "could not serialise the envelope", .failure)
+        }
+        line.withUnsafeBytes { buf in
+            var off = 0
+            while off < buf.count {
+                let n = write(resultFD, buf.baseAddress! + off, buf.count - off)
+                if n <= 0 { break }
+                off += n
+            }
+        }
+        return .ok
+    }
+
+    let data: Data
+    do {
+        data = try readInput(args.positional[0], maxBytes: maxBytes)
+    } catch ReadError.tooLarge(let n) {
+        return finish(.rejected(code: "too_large", message: "input is at least \(n) bytes; limit \(maxBytes)"),
+                      sha: String(repeating: "0", count: 64), head: Data())
+    } catch ReadError.notRegular {
+        return finish(.rejected(code: "bad_input", message: "not a regular file"),
+                      sha: String(repeating: "0", count: 64), head: Data())
+    } catch {
+        return finish(.engineError(code: "unreadable", message: "\(error)"),
+                      sha: String(repeating: "0", count: 64), head: Data())
+    }
+    let sha = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    let head = data.prefix(1024)
+
+    // Per-job parameters: flags win over the environment the blastbox agent forwards.
+    let envMode = (env["WTQRK_MODE"] ?? "default").trimmingCharacters(in: .whitespaces)
+    guard ["default", "heavy", ""].contains(envMode) || args.flags.contains("--heavy") else {
+        return finish(.rejected(code: "bad_param", message: "WTQRK_MODE must be default or heavy, not \(envMode.prefix(32))"),
+                      sha: sha, head: head)
+    }
+    let heavy = args.flags.contains("--heavy") || envMode == "heavy"
+    let rawConfig = args.options["--config-json"]
+        ?? env["WTQRK_CONFIG"].flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
+    var config: String?
+    if let rawConfig {
+        do { config = try ScanOutputValidator.canonicalConfig(rawConfig) }
+        catch { return finish(.rejected(code: "bad_config", message: "\(error)"), sha: sha, head: head) }
+    }
+
+    let (out, code) = await ScanJob.scan(data: data, heavy: heavy, configJSON: config,
+                                         compute: compute, budget: budget)
+    return finish(BlastboxMode.outcome(of: out, exit: code), sha: sha, head: head)
+}
+
 /// `sandbox_check(getpid(), NULL, SANDBOX_FILTER_NONE)`: nonzero when the kernel has this process
 /// sandboxed. (libsystem_sandbox; called without variadic arguments, so the C ABI is plain.)
 @_silgen_name("sandbox_check")
@@ -214,6 +288,7 @@ struct WTQRKScan {
         let code: ScanExit
         switch argv.dropFirst().first {
         case "scan": code = await runScan(argv.dropFirst(2))
+        case "blastbox": code = await runBlastbox(argv.dropFirst(2))
         case "self-test": code = await runSelfTest(argv.dropFirst(2))
         case "render-qr":
             let rest = Array(argv.dropFirst(2))

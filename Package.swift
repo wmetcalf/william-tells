@@ -27,7 +27,7 @@ let package = Package(
         // One-shot scanner for running one untrusted image per sandboxed process (blastbox).
         .executableTarget(
             name: "wtqrk-scan",
-            dependencies: ["QRScanCore"],
+            dependencies: ["QRScanCore", "QRSandbox"],
             path: "Sources/wtqrk-scan",
             exclude: ["Info.plist"],
             linkerSettings: [
